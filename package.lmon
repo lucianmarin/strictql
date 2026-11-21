@@ -1,0 +1,5 @@
+name: "strictql"
+version: "0.1.0"
+entry: "main.str"
+deps:
+    strlib: "lucianmarin/strlib"

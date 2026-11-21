@@ -1,0 +1,107 @@
+# PostgreSQL-dialect SQL Lexer
+
+class Token:
+    kind: str   # "IDENT", "STRING", "NUMBER", "PARAM", "OP", "EOF"
+    value: str
+
+    def __init__(self, kind: str, value: str) -> None:
+        self.kind = kind
+        self.value = value
+
+def _is_space(ch: str) -> bool:
+    return ch == " " or ch == "\t" or ch == "\n" or ch == "\r"
+
+def _is_digit(ch: str) -> bool:
+    return ch >= "0" and ch <= "9"
+
+def _is_alpha(ch: str) -> bool:
+    return (ch >= "a" and ch <= "z") or (ch >= "A" and ch <= "Z") or ch == "_"
+
+def _is_alnum(ch: str) -> bool:
+    return _is_alpha(ch) or _is_digit(ch)
+
+def tokenize(sql: str) -> list[Token]:
+    tokens: list[Token] = []
+    i = 0
+    n = len(sql)
+    while i < n:
+        ch = sql[i]
+        if _is_space(ch):
+            i += 1
+            continue
+        # Line comment --
+        if ch == "-" and i + 1 < n and sql[i + 1] == "-":
+            i += 2
+            while i < n and sql[i] != "\n":
+                i += 1
+            continue
+        # Single-quoted string literal
+        if ch == "'":
+            i += 1
+            s = ""
+            while i < n:
+                if sql[i] == "'":
+                    if i + 1 < n and sql[i + 1] == "'":
+                        s = s + "'"
+                        i += 2
+                    else:
+                        i += 1
+                        break
+                else:
+                    s = s + sql[i]
+                    i += 1
+            tokens.append(Token("STRING", s))
+            continue
+        # Double-quoted identifier
+        if ch == "\"":
+            i += 1
+            s = ""
+            while i < n:
+                if sql[i] == "\"":
+                    if i + 1 < n and sql[i + 1] == "\"":
+                        s = s + "\""
+                        i += 2
+                    else:
+                        i += 1
+                        break
+                else:
+                    s = s + sql[i]
+                    i += 1
+            tokens.append(Token("IDENT", s))
+            continue
+        # Positional parameter $1, $2, ...
+        if ch == "$" and i + 1 < n and _is_digit(sql[i + 1]):
+            i += 1
+            num = ""
+            while i < n and _is_digit(sql[i]):
+                num = num + sql[i]
+                i += 1
+            tokens.append(Token("PARAM", num))
+            continue
+        # Number literal
+        if _is_digit(ch):
+            num = ""
+            while i < n and (_is_digit(sql[i]) or sql[i] == "."):
+                num = num + sql[i]
+                i += 1
+            tokens.append(Token("NUMBER", num))
+            continue
+        # Identifier / keyword
+        if _is_alpha(ch):
+            ident = ""
+            while i < n and _is_alnum(sql[i]):
+                ident = ident + sql[i]
+                i += 1
+            tokens.append(Token("IDENT", ident))
+            continue
+        # Two-char operators
+        if i + 1 < n:
+            two = ch + sql[i + 1]
+            if two == "!=" or two == "<>" or two == "<=" or two == ">=" or two == "::":
+                tokens.append(Token("OP", two))
+                i += 2
+                continue
+        tokens.append(Token("OP", ch))
+        i += 1
+    tokens.append(Token("EOF", ""))
+    return tokens

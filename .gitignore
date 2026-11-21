@@ -1,0 +1,21 @@
+# Compiled binary & build artifacts
+strictql
+*.o
+*.out
+
+# Database & runtime files
+*.sqlitedb
+*.sqlitedb.wal
+*.sqlitedb.shm
+*.sqlitedb.lock
+*.db
+*.wal
+*.shm
+*.lock
+*.sock
+.s.PGSQL.*
+
+# OS & editor files
+.DS_Store
+*.swp
+*~

@@ -1,0 +1,127 @@
+import engine
+import multiprocessing
+import os
+
+_mp_db_path: str = ""
+
+def _cleanup_db(path: str) -> None:
+    if os.exists(path):
+        os.remove(path)
+    if os.exists(path + ".wal"):
+        os.remove(path + ".wal")
+    if os.exists(path + ".shm"):
+        os.remove(path + ".shm")
+    if os.exists(path + ".lock"):
+        os.remove(path + ".lock")
+
+def _mp_writer_1() -> int:
+    db = engine.open_db(_mp_db_path.copy())
+    i = 0
+    while i < 10:
+        db.execute("INSERT INTO events (source, val) VALUES ($1, $2)", ["p1", str(i)])
+        i += 1
+    db.close()
+    return 0
+
+def _mp_writer_2() -> int:
+    db = engine.open_db(_mp_db_path.copy())
+    i = 0
+    while i < 10:
+        db.execute("INSERT INTO events (source, val) VALUES ($1, $2)", ["p2", str(i)])
+        i += 1
+    db.close()
+    return 0
+
+def test_crud_and_pg_dialect() -> None:
+    path = "/tmp/strictql_test_crud.strictql"
+    _cleanup_db(path)
+
+    db = engine.open_db(path.copy())
+    db.execute("CREATE TABLE IF NOT EXISTS users (id SERIAL PRIMARY KEY, name TEXT NOT NULL, age INT)")
+
+    r1 = db.execute("INSERT INTO users (name, age) VALUES ('Alice', 30) RETURNING id, name")
+    assert r1.command_tag == "INSERT 0 1"
+    assert len(r1.rows) == 1
+    assert r1.rows[0][0] == "1"
+    assert r1.rows[0][1] == "Alice"
+
+    db.execute("INSERT INTO users (name, age) VALUES ($1, $2)", ["Bob", "25"])
+    db.execute("INSERT INTO users (name, age) VALUES ('Charlie', 35)")
+
+    # SELECT with WHERE, ILIKE, ORDER BY, LIMIT, OFFSET
+    res = db.execute("SELECT name, age FROM users WHERE age >= 25 ORDER BY age DESC LIMIT 2")
+    assert len(res.rows) == 2
+    assert res.rows[0][0] == "Charlie"
+    assert res.rows[1][0] == "Alice"
+
+    res_ilike = db.execute("SELECT name FROM users WHERE name ILIKE 'a%'")
+    assert len(res_ilike.rows) == 1
+    assert res_ilike.rows[0][0] == "Alice"
+
+    # UPDATE
+    upd = db.execute("UPDATE users SET age = 31 WHERE name = 'Alice'")
+    assert upd.row_count == 1
+    res_a = db.execute("SELECT age FROM users WHERE name = 'Alice'")
+    assert res_a.rows[0][0] == "31"
+
+    # DELETE
+    dl = db.execute("DELETE FROM users WHERE name = 'Bob'")
+    assert dl.row_count == 1
+    res_all = db.execute("SELECT name FROM users ORDER BY id ASC")
+    assert len(res_all.rows) == 2
+
+    # Transactions: ROLLBACK and COMMIT
+    db.execute("BEGIN")
+    db.execute("INSERT INTO users (name, age) VALUES ('Temp', 99)")
+    db.execute("ROLLBACK")
+    assert len(db.execute("SELECT name FROM users").rows) == 2
+
+    db.execute("BEGIN")
+    db.execute("INSERT INTO users (name, age) VALUES ('Dave', 40)")
+    db.execute("COMMIT")
+    assert len(db.execute("SELECT name FROM users").rows) == 3
+
+    # PostgreSQL probe queries
+    v = db.execute("SELECT version()")
+    assert len(v.rows) == 1
+    t = db.execute("SELECT table_name FROM information_schema.tables")
+    assert len(t.rows) == 1
+    assert t.rows[0][0] == "users"
+
+    db.close()
+
+    # Reopen and verify persistence
+    db2 = engine.open_db(path.copy())
+    res2 = db2.execute("SELECT name FROM users ORDER BY id ASC")
+    assert len(res2.rows) == 3
+    assert res2.rows[0][0] == "Alice"
+    assert res2.rows[2][0] == "Dave"
+    db2.close()
+    _cleanup_db(path)
+
+def test_multiprocess_writers() -> None:
+    global _mp_db_path
+    path = "/tmp/strictql_test_mp.strictql"
+    _cleanup_db(path)
+    _mp_db_path = path.copy()
+
+    db = engine.open_db(path.copy())
+    db.execute("CREATE TABLE events (id SERIAL PRIMARY KEY, source TEXT, val INT)")
+    db.close()
+
+    p1 = multiprocessing.Process(_mp_writer_1)
+    p2 = multiprocessing.Process(_mp_writer_2)
+    p1.start()
+    p2.start()
+    assert p1.join() == 0
+    assert p2.join() == 0
+
+    db_check = engine.open_db(path.copy())
+    res = db_check.execute("SELECT source, val FROM events")
+    assert len(res.rows) == 20
+    db_check.close()
+    _cleanup_db(path)
+
+test_crud_and_pg_dialect()
+test_multiprocess_writers()
+print("test_strictql: ok")

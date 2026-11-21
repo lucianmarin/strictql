@@ -1,0 +1,56 @@
+import engine
+import pgwire
+import sys
+
+def main() -> None:
+    args = sys.argv
+    if len(args) < 2:
+        print("Usage: strictql <db_path> [--port <port>] [--socket <path>] | --dir <dir> [--port <port>] [--socket <path>] | <db_path> -c <sql>")
+        return
+    db_path = ""
+    db_dir = ""
+    port = 5432
+    sock_path = ""
+    one_shot = ""
+    i = 1
+    while i < len(args):
+        if args[i] == "--port" and i + 1 < len(args):
+            port = int(args[i + 1])
+            i += 2
+        elif args[i] == "--socket" and i + 1 < len(args):
+            sock_path = args[i + 1].copy()
+            i += 2
+        elif args[i] == "--dir" and i + 1 < len(args):
+            db_dir = args[i + 1].copy()
+            i += 2
+        elif args[i] == "-c" and i + 1 < len(args):
+            one_shot = args[i + 1].copy()
+            i += 2
+        else:
+            if len(db_path) == 0:
+                db_path = args[i].copy()
+            i += 1
+
+    if len(one_shot) > 0:
+        db = engine.open_db(db_path)
+        res = db.execute(one_shot)
+        if len(res.columns) > 0:
+            print(" | ".join(res.columns))
+            ri = 0
+            while ri < len(res.rows):
+                print(" | ".join(res.rows[ri]))
+                ri += 1
+        else:
+            print(res.command_tag)
+        db.close()
+    elif len(db_dir) > 0:
+        if len(sock_path) > 0:
+            pgwire.serve_unix(db_dir, sock_path, True)
+        else:
+            pgwire.serve(db_dir, port, True)
+    elif len(sock_path) > 0:
+        pgwire.serve_unix(db_path, sock_path, False)
+    else:
+        pgwire.serve(db_path, port, False)
+
+main()

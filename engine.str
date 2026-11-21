@@ -1,0 +1,2152 @@
+import sql
+import storage
+
+def _contains_bytes(hay: str, needle: str, icase: bool) -> bool:
+    hn = len(hay)
+    nn = len(needle)
+    if nn == 0:
+        return True
+    if nn > hn:
+        return False
+    hb = hay.bin
+    nb = needle.bin
+    limit = hn - nn
+    i = 0
+    while i <= limit:
+        j = 0
+        while j < nn:
+            hc = int(val(hb + i + j))
+            nc = int(val(nb + j))
+            if icase:
+                if hc >= 65 and hc <= 90:
+                    hc += 32
+                if nc >= 65 and nc <= 90:
+                    nc += 32
+            if hc != nc:
+                break
+            j += 1
+        if j == nn:
+            return True
+        i += 1
+    return False
+
+def _is_simple_contains_pat(pat: str) -> bool:
+    n = len(pat)
+    if n < 2:
+        return False
+    b = pat.bin
+    if int(val(b)) != 37 or int(val(b + n - 1)) != 37:
+        return False
+    i = 1
+    while i < n - 1:
+        c = int(val(b + i))
+        if c == 37 or c == 95:
+            return False
+        i += 1
+    return True
+
+def _is_numeric_col_type(ct: str) -> bool:
+    u = ct.upper()
+    return u == "DOUBLE PRECISION" or u == "FLOAT" or u == "REAL" or u == "INT" or u == "INTEGER" or u == "BIGINT" or u == "SERIAL" or u == "BIGSERIAL" or u == "NUMERIC" or u == "DECIMAL"
+
+def _qsort_f64(idxs: list[int], keys: list[f64], lo: int, hi: int, desc: bool) -> None:
+    if lo >= hi:
+        return
+    mid = (lo + hi) >> 1
+    pivot = keys[mid]
+    i = lo
+    j = hi
+    while i <= j:
+        if desc:
+            while keys[i] > pivot:
+                i += 1
+            while keys[j] < pivot:
+                j -= 1
+        else:
+            while keys[i] < pivot:
+                i += 1
+            while keys[j] > pivot:
+                j -= 1
+        if i <= j:
+            tk = keys[i]
+            keys[i] = keys[j]
+            keys[j] = tk
+            ti = idxs[i]
+            idxs[i] = idxs[j]
+            idxs[j] = ti
+            i += 1
+            j -= 1
+    if lo < j:
+        _qsort_f64(idxs, keys, lo, j, desc)
+    if i < hi:
+        _qsort_f64(idxs, keys, i, hi, desc)
+
+def _qsort_str(idxs: list[int], keys: list[str], lo: int, hi: int, desc: bool) -> None:
+    if lo >= hi:
+        return
+    mid = (lo + hi) >> 1
+    pivot = keys[mid].copy()
+    i = lo
+    j = hi
+    while i <= j:
+        if desc:
+            while keys[i] > pivot:
+                i += 1
+            while keys[j] < pivot:
+                j -= 1
+        else:
+            while keys[i] < pivot:
+                i += 1
+            while keys[j] > pivot:
+                j -= 1
+        if i <= j:
+            tk = keys[i].copy()
+            keys[i] = keys[j].copy()
+            keys[j] = tk
+            ti = idxs[i]
+            idxs[i] = idxs[j]
+            idxs[j] = ti
+            i += 1
+            j -= 1
+    if lo < j:
+        _qsort_str(idxs, keys, lo, j, desc)
+    if i < hi:
+        _qsort_str(idxs, keys, i, hi, desc)
+
+class QueryResult:
+    columns: list[str]
+    rows: list[list[str]]
+    command_tag: str
+    row_count: int
+
+    def __init__(self, columns: list[str], rows: list[list[str]], command_tag: str, row_count: int) -> None:
+        self.columns = columns
+        self.rows = rows
+        self.command_tag = command_tag
+        self.row_count = row_count
+
+def _like_match(text: str, pattern: str, case_insensitive: bool) -> bool:
+    t = text.lower() if case_insensitive else text
+    p = pattern.lower() if case_insensitive else pattern
+    ti = 0
+    pi = 0
+    tn = len(t)
+    pn = len(p)
+    star_pi = -1
+    star_ti = 0
+    while ti < tn:
+        if pi < pn and (p[pi] == "_" or p[pi] == t[ti]):
+            ti += 1
+            pi += 1
+        elif pi < pn and p[pi] == "%":
+            star_pi = pi
+            star_ti = ti
+            pi += 1
+        elif star_pi != -1:
+            pi = star_pi + 1
+            star_ti += 1
+            ti = star_ti
+        else:
+            return False
+    while pi < pn and p[pi] == "%":
+        pi += 1
+    return pi == pn
+
+def _is_numeric_str(s: str) -> bool:
+    if len(s) == 0:
+        return False
+    i = 0
+    if s[0] == "-":
+        if len(s) == 1:
+            return False
+        i = 1
+    has_dot = False
+    while i < len(s):
+        ch = s[i]
+        if ch == ".":
+            if has_dot:
+                return False
+            has_dot = True
+        elif ch < "0" or ch > "9":
+            return False
+        i += 1
+    return True
+
+def _cmp_values(a: str, b: str) -> int:
+    if _is_numeric_str(a) and _is_numeric_str(b):
+        fa = float(a)
+        fb = float(b)
+        if fa < fb:
+            return -1
+        if fa > fb:
+            return 1
+        return 0
+    if a < b:
+        return -1
+    if a > b:
+        return 1
+    return 0
+
+class _Literal:
+    is_null: bool
+    value: str
+
+    def __init__(self, is_null: bool, value: str) -> None:
+        self.is_null = is_null
+        self.value = value
+
+class _Parser:
+    tokens: list[sql.Token]
+    pos: int
+    params: list[str]
+
+    def __init__(self, tokens: list[sql.Token], params: list[str]) -> None:
+        self.tokens = tokens
+        self.pos = 0
+        self.params = params
+
+    def peek_kind(self) -> str:
+        return self.tokens[self.pos].kind.copy()
+
+    def peek_val(self) -> str:
+        return self.tokens[self.pos].value.copy()
+
+    def peek_upper(self) -> str:
+        return self.tokens[self.pos].value.upper()
+
+    def step(self) -> None:
+        if self.pos + 1 < len(self.tokens):
+            self.pos += 1
+
+    def match_kw(self, kw: str) -> bool:
+        if self.tokens[self.pos].kind == "IDENT" and self.peek_upper() == kw:
+            self.step()
+            return True
+        return False
+
+    def match_op(self, op: str) -> bool:
+        if self.tokens[self.pos].kind == "OP" and self.tokens[self.pos].value == op:
+            self.step()
+            return True
+        return False
+
+    def expect_op(self, op: str) -> None:
+        if not self.match_op(op):
+            raise f"SyntaxError: expected '{op}', got '{self.tokens[self.pos].value}'"
+
+    def expect_ident(self) -> str:
+        if self.tokens[self.pos].kind != "IDENT":
+            raise f"SyntaxError: expected identifier, got '{self.tokens[self.pos].value}'"
+        v = self.tokens[self.pos].value.copy()
+        self.step()
+        return v
+
+    def parse_literal(self) -> _Literal:
+        if self.match_kw("NULL"):
+            return _Literal(True, "")
+        if self.match_kw("TRUE"):
+            return _Literal(False, "true")
+        if self.match_kw("FALSE"):
+            return _Literal(False, "false")
+        neg = False
+        if self.match_op("-"):
+            neg = True
+        k = self.tokens[self.pos].kind.copy()
+        tv = self.tokens[self.pos].value.copy()
+        self.step()
+        # Skip optional PostgreSQL type cast ::type
+        if self.match_op("::"):
+            self.step()
+        if k == "STRING":
+            return _Literal(False, tv)
+        if k == "NUMBER":
+            if neg:
+                return _Literal(False, "-" + tv)
+            return _Literal(False, tv)
+        if k == "PARAM":
+            idx = int(tv) - 1
+            if idx < 0 or idx >= len(self.params):
+                raise f"ValueError: missing parameter ${tv}"
+            return _Literal(False, self.params[idx].copy())
+        raise f"SyntaxError: unexpected literal '{tv}'"
+
+class _AggSpec:
+    fn: str
+    col: str
+    alias: str
+
+    def __init__(self, fn: str, col: str, alias: str) -> None:
+        self.fn = fn
+        self.col = col
+        self.alias = alias
+
+class _JoinSpec:
+    is_left: bool
+    table_name: str
+    alias: str
+    left_alias: str
+    left_col: str
+    right_alias: str
+    right_col: str
+
+    def __init__(self, is_left: bool, table_name: str, alias: str, left_alias: str, left_col: str, right_alias: str, right_col: str) -> None:
+        self.is_left = is_left
+        self.table_name = table_name
+        self.alias = alias
+        self.left_alias = left_alias
+        self.left_col = left_col
+        self.right_alias = right_alias
+        self.right_col = right_col
+
+class _InsertPlan:
+    table_name: str
+    col_cidxs: list[int]
+    param_idxs: list[int]
+
+    def __init__(self, table_name: str, col_cidxs: list[int], param_idxs: list[int]) -> None:
+        self.table_name = table_name
+        self.col_cidxs = col_cidxs
+        self.param_idxs = param_idxs
+
+class ParsedInsert:
+    ok: bool
+    prefix: str
+    vals: list[str]
+    nulls: list[bool]
+
+    def __init__(self, ok: bool, prefix: str, vals: list[str], nulls: list[bool]) -> None:
+        self.ok = ok
+        self.prefix = prefix
+        self.vals = vals
+        self.nulls = nulls
+
+def parse_literal_insert(query: str) -> ParsedInsert:
+    n = len(query)
+    if n < 20:
+        return ParsedInsert(False, "", [], [])
+    if query[0:12].upper() != "INSERT INTO ":
+        return ParsedInsert(False, "", [], [])
+    vpos = -1
+    i = 12
+    while i + 8 < n:
+        c = query[i]
+        if (c == "V" or c == "v") and (query[i - 1] == " " or query[i - 1] == ")"):
+            if query[i:i + 6].upper() == "VALUES":
+                j = i + 6
+                while j < n and (query[j] == " " or query[j] == "\t"):
+                    j += 1
+                if j < n and query[j] == "(":
+                    vpos = j + 1
+                    break
+        i += 1
+    if vpos < 0:
+        return ParsedInsert(False, "", [], [])
+    prefix = query[0:vpos]
+    vals_in: list[str] = []
+    nulls_in: list[bool] = []
+    pos = vpos
+    while pos < n:
+        while pos < n and (query[pos] == " " or query[pos] == "\t" or query[pos] == "\n"):
+            pos += 1
+        if pos >= n:
+            return ParsedInsert(False, "", [], [])
+        if query[pos] == "'":
+            pos += 1
+            start = pos
+            has_esc = False
+            while pos < n:
+                if query[pos] == "'":
+                    if pos + 1 < n and query[pos + 1] == "'":
+                        has_esc = True
+                        pos += 2
+                        continue
+                    break
+                pos += 1
+            if pos >= n:
+                return ParsedInsert(False, "", [], [])
+            raw = query[start:pos]
+            if has_esc:
+                raw = raw.replace("''", "'")
+            vals_in.append(raw)
+            nulls_in.append(False)
+            pos += 1
+        else:
+            start = pos
+            while pos < n and query[pos] != "," and query[pos] != ")":
+                pos += 1
+            tok = query[start:pos].strip()
+            tu = tok.upper()
+            if tu == "NULL":
+                vals_in.append("")
+                nulls_in.append(True)
+            elif tu == "TRUE":
+                vals_in.append("true")
+                nulls_in.append(False)
+            elif tu == "FALSE":
+                vals_in.append("false")
+                nulls_in.append(False)
+            else:
+                if "(" in tok or " " in tok:
+                    return ParsedInsert(False, "", [], [])
+                vals_in.append(tok)
+                nulls_in.append(False)
+        while pos < n and (query[pos] == " " or query[pos] == "\t" or query[pos] == "\n"):
+            pos += 1
+        if pos < n and query[pos] == ",":
+            pos += 1
+            continue
+        if pos < n and query[pos] == ")":
+            pos += 1
+            break
+        return ParsedInsert(False, "", [], [])
+    while pos < n and (query[pos] == " " or query[pos] == "\t" or query[pos] == "\n" or query[pos] == ";"):
+        pos += 1
+    if pos != n:
+        return ParsedInsert(False, "", [], [])
+    return ParsedInsert(True, prefix, vals_in, nulls_in)
+
+class Database:
+    store: storage.Storage
+    in_tx: bool
+    tx_id: i64
+    pending_wal: list[str]
+    ins_cache: dict[str, _InsertPlan]
+    tok_cache: dict[str, list[sql.Token]]
+
+    def __init__(self, path: str) -> None:
+        self.store = storage.Storage(path)
+        self.in_tx = False
+        self.tx_id = 0
+        self.pending_wal = []
+        self.ins_cache = {}
+        self.tok_cache = {}
+
+    def close(self) -> None:
+        self.in_tx = False
+        self.store.close()
+
+    def _begin_auto_tx(self) -> i64:
+        if self.in_tx:
+            return self.tx_id
+        return self.store.next_txid()
+
+    def _commit_records(self, records: list[str]) -> None:
+        if self.in_tx:
+            i = 0
+            while i < len(records):
+                self.pending_wal.append(records[i].copy())
+                i += 1
+        else:
+            self.store.append_wal(records)
+
+    def _eval_where_atom(self, p: _Parser, tbl: storage.Table, row: storage.Row) -> bool:
+        if p.match_op("("):
+            res = self._eval_where_or(p, tbl, row)
+            p.expect_op(")")
+            return res
+        if p.match_kw("NOT"):
+            return not self._eval_where_atom(p, tbl, row)
+        col_name = p.expect_ident()
+        # Handle optional table.col prefix
+        if p.match_op("."):
+            col_name = p.expect_ident()
+        ci = tbl.col_index(col_name)
+        if ci < 0:
+            raise f"ColumnError: column '{col_name}' does not exist"
+        is_null = row.is_null(ci)
+        col_val = row.get_str(ci)
+
+        if p.match_kw("IS"):
+            neg = p.match_kw("NOT")
+            if p.match_kw("NULL"):
+                return (not is_null) if neg else is_null
+            raise "SyntaxError: expected NULL after IS"
+
+        not_in = False
+        if p.match_kw("NOT"):
+            not_in = True
+        if p.match_kw("IN"):
+            p.expect_op("(")
+            matched_in = False
+            while not p.match_op(")"):
+                lit = p.parse_literal()
+                if not is_null and not lit.is_null:
+                    if _cmp_values(col_val, lit.value.copy()) == 0:
+                        matched_in = True
+                p.match_op(",")
+            if is_null:
+                return False
+            return (not matched_in) if not_in else matched_in
+        if not_in:
+            raise "SyntaxError: expected IN after NOT"
+
+        if p.match_kw("ILIKE"):
+            lit = p.parse_literal()
+            if is_null or lit.is_null:
+                return False
+            return _like_match(col_val, lit.value.copy(), True)
+
+        if p.match_kw("LIKE"):
+            lit = p.parse_literal()
+            if is_null or lit.is_null:
+                return False
+            return _like_match(col_val, lit.value.copy(), False)
+
+        op = p.peek_val()
+        p.step()
+        lit = p.parse_literal()
+        if is_null or lit.is_null:
+            return False
+        cmp_res = _cmp_values(col_val, lit.value.copy())
+        if op == "=":
+            return cmp_res == 0
+        if op == "!=" or op == "<>":
+            return cmp_res != 0
+        if op == "<":
+            return cmp_res < 0
+        if op == "<=":
+            return cmp_res <= 0
+        if op == ">":
+            return cmp_res > 0
+        if op == ">=":
+            return cmp_res >= 0
+        raise f"SyntaxError: unsupported operator '{op}'"
+
+    def _eval_where_and(self, p: _Parser, tbl: storage.Table, row: storage.Row) -> bool:
+        left = self._eval_where_atom(p, tbl, row)
+        while p.match_kw("AND"):
+            right = self._eval_where_atom(p, tbl, row)
+            left = left and right
+        return left
+
+    def _eval_where_or(self, p: _Parser, tbl: storage.Table, row: storage.Row) -> bool:
+        left = self._eval_where_and(p, tbl, row)
+        while p.match_kw("OR"):
+            right = self._eval_where_and(p, tbl, row)
+            left = left or right
+        return left
+
+    def _row_matches_where(self, p: _Parser, where_pos: int, tbl: storage.Table, row: storage.Row) -> bool:
+        if where_pos < 0:
+            return True
+        saved = p.pos
+        p.pos = where_pos
+        ok = self._eval_where_or(p, tbl, row)
+        p.pos = saved
+        return ok
+
+    def _skip_where_clause(self, p: _Parser) -> None:
+        depth = 0
+        while p.peek_kind() != "EOF":
+            if p.peek_kind() == "OP":
+                pv = p.peek_val()
+                if pv == "(":
+                    depth += 1
+                elif pv == ")":
+                    if depth == 0:
+                        break
+                    depth -= 1
+                elif pv == ";" and depth == 0:
+                    break
+            elif depth == 0 and p.peek_kind() == "IDENT":
+                u = p.peek_upper()
+                if u == "ORDER" or u == "LIMIT" or u == "OFFSET" or u == "RETURNING":
+                    break
+            p.step()
+
+    def _project_row(self, tbl: storage.Table, row: storage.Row, col_names: list[str]) -> list[str]:
+        out: list[str] = []
+        i = 0
+        while i < len(col_names):
+            ci = tbl.col_index(col_names[i])
+            if ci < 0:
+                raise f"ColumnError: column '{col_names[i]}' does not exist"
+            out.append("NULL" if row.is_null(ci) else row.get_str(ci))
+            i += 1
+        return out
+
+    def _exec_create_table(self, p: _Parser) -> QueryResult:
+        if_not_exists = False
+        if p.match_kw("IF"):
+            if p.match_kw("NOT") and p.match_kw("EXISTS"):
+                if_not_exists = True
+        tname = p.expect_ident()
+        if p.match_op("."):
+            tname = p.expect_ident()
+        p.expect_op("(")
+        cols: list[storage.ColumnDef] = []
+        while not p.match_op(")"):
+            if p.match_kw("PRIMARY") or p.match_kw("UNIQUE") or p.match_kw("CONSTRAINT") or p.match_kw("FOREIGN"):
+                # Skip table-level constraint until comma or closing paren
+                depth = 0
+                while p.peek_kind() != "EOF":
+                    if p.peek_kind() == "OP":
+                        pv = p.peek_val()
+                        if pv == "(":
+                            depth += 1
+                        elif pv == ")":
+                            if depth == 0:
+                                break
+                            depth -= 1
+                        elif pv == "," and depth == 0:
+                            break
+                    p.step()
+                p.match_op(",")
+                continue
+            cname = p.expect_ident()
+            ctype = p.expect_ident().upper()
+            # Handle VARCHAR(255) or DOUBLE PRECISION or TIMESTAMP WITH TIME ZONE
+            if p.match_op("("):
+                while p.peek_kind() != "EOF" and not p.match_op(")"):
+                    p.step()
+            if ctype == "DOUBLE" and p.match_kw("PRECISION"):
+                ctype = "DOUBLE PRECISION"
+            if ctype == "CHARACTER" and p.match_kw("VARYING"):
+                ctype = "VARCHAR"
+                if p.match_op("("):
+                    while p.peek_kind() != "EOF" and not p.match_op(")"):
+                        p.step()
+            if ctype == "TIMESTAMP" and p.match_kw("WITH"):
+                p.match_kw("TIME")
+                p.match_kw("ZONE")
+                ctype = "TIMESTAMPTZ"
+
+            is_serial = (ctype == "SERIAL" or ctype == "BIGSERIAL")
+            is_pk = False
+            not_null = is_serial
+            # Parse column constraints
+            while p.peek_kind() != "EOF" and not (p.peek_kind() == "OP" and (p.peek_val() == "," or p.peek_val() == ")")):
+                if p.match_kw("PRIMARY"):
+                    p.match_kw("KEY")
+                    is_pk = True
+                    not_null = True
+                elif p.match_kw("NOT"):
+                    p.match_kw("NULL")
+                    not_null = True
+                elif p.match_kw("NULL"):
+                    not_null = False
+                elif p.match_kw("UNIQUE"):
+                    pass
+                elif p.match_kw("GENERATED"):
+                    is_serial = True
+                    while p.peek_kind() != "EOF" and not (p.peek_kind() == "OP" and (p.peek_val() == "," or p.peek_val() == ")")):
+                        if p.match_kw("IDENTITY"):
+                            break
+                        p.step()
+                elif p.match_kw("DEFAULT"):
+                    p.step()
+                else:
+                    p.step()
+            cols.append(storage.ColumnDef(cname, ctype, is_pk, is_serial, not_null))
+            p.match_op(",")
+
+        if not self.in_tx:
+            self.store.reload()
+        if self.store.find_table(tname) >= 0:
+            if if_not_exists:
+                return QueryResult([], [], "CREATE TABLE", 0)
+            raise f"TableError: relation '{tname}' already exists"
+        t = storage.Table(tname, cols)
+        rec = self.store._serialize_table_def(t)
+        self.store.tables.append(t)
+        self._commit_records([rec])
+        return QueryResult([], [], "CREATE TABLE", 0)
+
+    def _exec_drop_table(self, p: _Parser) -> QueryResult:
+        if_exists = False
+        if p.match_kw("IF") and p.match_kw("EXISTS"):
+            if_exists = True
+        tname = p.expect_ident()
+        if not self.in_tx:
+            self.store.reload()
+        ti = self.store.find_table(tname)
+        if ti < 0:
+            if if_exists:
+                return QueryResult([], [], "DROP TABLE", 0)
+            raise f"TableError: relation '{tname}' does not exist"
+        self.store.tables.pop(ti)
+        self._commit_records(["DROP\t" + storage._escape_field(tname)])
+        self.ins_cache = {}
+        return QueryResult([], [], "DROP TABLE", 0)
+
+    def _exec_drop_index(self, p: _Parser) -> QueryResult:
+        self.in_tx = self.in_tx
+        p.match_kw("CONCURRENTLY")
+        if_exists = False
+        if p.match_kw("IF"):
+            p.match_kw("EXISTS")
+            if_exists = True
+        iname = p.expect_ident()
+        if p.match_op("."):
+            iname = p.expect_ident()
+        p.match_kw("CASCADE")
+        p.match_kw("RESTRICT")
+        if not self.in_tx:
+            self.store.reload()
+        return QueryResult([], [], "DROP INDEX", 0)
+
+    def _exec_alter_table(self, p: _Parser) -> QueryResult:
+        if p.match_kw("IF"):
+            p.match_kw("EXISTS")
+        tname = p.expect_ident()
+        if p.match_op("."):
+            tname = p.expect_ident()
+        if not self.in_tx:
+            self.store.reload()
+        ti = self.store.find_table(tname)
+        if ti < 0:
+            raise f"TableError: relation '{tname}' does not exist"
+
+        while p.peek_kind() != "EOF" and p.peek_val() != ";":
+            if p.match_kw("ADD"):
+                if p.match_kw("CONSTRAINT"):
+                    # Skip constraint definition until comma or end
+                    depth = 0
+                    while p.peek_kind() != "EOF":
+                        pv = p.peek_val()
+                        if p.peek_kind() == "OP" and pv == "(":
+                            depth += 1
+                        elif p.peek_kind() == "OP" and pv == ")":
+                            depth -= 1
+                        elif depth == 0 and p.peek_kind() == "OP" and (pv == "," or pv == ";"):
+                            break
+                        p.step()
+                else:
+                    p.match_kw("COLUMN")
+                    if p.match_kw("IF"):
+                        p.match_kw("NOT")
+                        p.match_kw("EXISTS")
+                    cname = p.expect_ident()
+                    ctype = p.expect_ident().upper()
+                    if p.match_op("("):
+                        while p.peek_kind() != "EOF" and not p.match_op(")"):
+                            p.step()
+                    if ctype == "DOUBLE" and p.match_kw("PRECISION"):
+                        ctype = "DOUBLE PRECISION"
+                    elif ctype == "CHARACTER" and p.match_kw("VARYING"):
+                        ctype = "VARCHAR"
+                        if p.match_op("("):
+                            while p.peek_kind() != "EOF" and not p.match_op(")"):
+                                p.step()
+                    not_null = False
+                    has_def = False
+                    def_val = ""
+                    while p.peek_kind() != "EOF" and p.peek_val() != "," and p.peek_val() != ";":
+                        if p.match_kw("NOT"):
+                            p.match_kw("NULL")
+                            not_null = True
+                        elif p.match_kw("NULL"):
+                            not_null = False
+                        elif p.match_kw("DEFAULT"):
+                            lit = p.parse_literal()
+                            if not lit.is_null:
+                                has_def = True
+                                def_val = lit.value.copy()
+                        else:
+                            p.step()
+                    if self.store.tables[ti].col_index(cname) < 0:
+                        col = storage.ColumnDef(cname, ctype.copy(), False, False, not_null, def_val.copy())
+                        self.store.tables[ti].columns.append(col)
+                        ri = 0
+                        while ri < len(self.store.tables[ti].rows):
+                            if has_def:
+                                self.store.tables[ti].rows[ri].cells.append(storage.encode_cell(ctype, def_val, False))
+                            else:
+                                self.store.tables[ti].rows[ri].cells.append(None)
+                            ri += 1
+            elif p.match_kw("DROP"):
+                if p.match_kw("CONSTRAINT"):
+                    if p.match_kw("IF"):
+                        p.match_kw("EXISTS")
+                    p.expect_ident()
+                    p.match_kw("CASCADE")
+                    p.match_kw("RESTRICT")
+                else:
+                    p.match_kw("COLUMN")
+                    if p.match_kw("IF"):
+                        p.match_kw("EXISTS")
+                    cname = p.expect_ident()
+                    p.match_kw("CASCADE")
+                    p.match_kw("RESTRICT")
+                    cidx = self.store.tables[ti].col_index(cname)
+                    if cidx >= 0:
+                        new_cols: list[storage.ColumnDef] = []
+                        ci = 0
+                        while ci < len(self.store.tables[ti].columns):
+                            if ci != cidx:
+                                oc = self.store.tables[ti].columns[ci]
+                                new_cols.append(storage.ColumnDef(oc.name.copy(), oc.col_type.copy(), oc.is_pk, oc.is_serial, oc.not_null, oc.default_val.copy()))
+                            ci += 1
+                        self.store.tables[ti].columns = new_cols
+                        ri = 0
+                        while ri < len(self.store.tables[ti].rows):
+                            nc: list[int | float | str | bool | None] = []
+                            ci = 0
+                            while ci < len(self.store.tables[ti].rows[ri].cells):
+                                if ci != cidx:
+                                    nc.append(storage.clone_cell(self.store.tables[ti].rows[ri].cells[ci]))
+                                ci += 1
+                            self.store.tables[ti].rows[ri].cells = nc
+                            ri += 1
+            elif p.match_kw("RENAME"):
+                if p.match_kw("TO"):
+                    new_tname = p.expect_ident()
+                    self.store.tables[ti].name = new_tname
+                else:
+                    p.match_kw("COLUMN")
+                    old_c = p.expect_ident()
+                    p.match_kw("TO")
+                    new_c = p.expect_ident()
+                    cidx = self.store.tables[ti].col_index(old_c)
+                    if cidx >= 0:
+                        self.store.tables[ti].columns[cidx].name = new_c
+            elif p.match_kw("ALTER"):
+                p.match_kw("COLUMN")
+                cname = p.expect_ident()
+                cidx = self.store.tables[ti].col_index(cname)
+                if p.match_kw("TYPE"):
+                    nt = p.expect_ident().upper()
+                    if p.match_op("("):
+                        while p.peek_kind() != "EOF" and not p.match_op(")"):
+                            p.step()
+                    if cidx >= 0:
+                        self.store.tables[ti].columns[cidx].col_type = nt
+                elif p.match_kw("SET"):
+                    if p.match_kw("NOT"):
+                        p.match_kw("NULL")
+                        if cidx >= 0:
+                            self.store.tables[ti].columns[cidx].not_null = True
+                    elif p.match_kw("DEFAULT"):
+                        lit = p.parse_literal()
+                        if cidx >= 0 and not lit.is_null:
+                            self.store.tables[ti].columns[cidx].default_val = lit.value.copy()
+                elif p.match_kw("DROP"):
+                    if p.match_kw("NOT"):
+                        p.match_kw("NULL")
+                        if cidx >= 0:
+                            self.store.tables[ti].columns[cidx].not_null = False
+                    elif p.match_kw("DEFAULT"):
+                        if cidx >= 0:
+                            self.store.tables[ti].columns[cidx].default_val = ""
+                while p.peek_kind() != "EOF" and p.peek_val() != "," and p.peek_val() != ";":
+                    p.step()
+            else:
+                p.step()
+            p.match_op(",")
+
+        self.ins_cache = {}
+        self.store.flush_schema()
+        return QueryResult([], [], "ALTER TABLE", 0)
+
+    def _exec_insert(self, p: _Parser) -> QueryResult:
+        if not p.match_kw("INTO"):
+            raise "SyntaxError: expected INTO after INSERT"
+        tname = p.expect_ident()
+        if p.match_op("."):
+            tname = p.expect_ident()
+        if not self.in_tx:
+            self.store.reload()
+        ti = self.store.find_table(tname)
+        if ti < 0:
+            raise f"TableError: relation '{tname}' does not exist"
+
+        target_cols: list[str] = []
+        if p.match_op("("):
+            while not p.match_op(")"):
+                target_cols.append(p.expect_ident())
+                p.match_op(",")
+        else:
+            ci = 0
+            while ci < len(self.store.tables[ti].columns):
+                target_cols.append(self.store.tables[ti].columns[ci].name.copy())
+                ci += 1
+
+        if not p.match_kw("VALUES"):
+            raise "SyntaxError: expected VALUES"
+
+        txid = self._begin_auto_tx()
+        inserted_idxs: list[int] = []
+        wal_recs: list[str] = []
+
+        while True:
+            p.expect_op("(")
+            lit_nulls: list[bool] = []
+            lit_vals: list[str] = []
+            while not p.match_op(")"):
+                lit = p.parse_literal()
+                lit_nulls.append(lit.is_null)
+                lit_vals.append(lit.value.copy())
+                p.match_op(",")
+
+            if len(lit_vals) != len(target_cols):
+                raise "ValueError: INSERT column count does not match VALUES count"
+
+            rid = self.store.tables[ti].next_seq
+            self.store.tables[ti].next_seq += 1
+            row_vals: list[str] = []
+            row_nulls: list[bool] = []
+            ci = 0
+            while ci < len(self.store.tables[ti].columns):
+                col = self.store.tables[ti].columns[ci]
+                # Check if supplied in target_cols
+                found = -1
+                j = 0
+                while j < len(target_cols):
+                    if target_cols[j].lower() == col.name.lower():
+                        found = j
+                        break
+                    j += 1
+                if found >= 0:
+                    row_nulls.append(lit_nulls[found])
+                    row_vals.append(lit_vals[found].copy())
+                elif col.is_serial:
+                    row_nulls.append(False)
+                    row_vals.append(str(rid))
+                else:
+                    row_nulls.append(True)
+                    row_vals.append("")
+                ci += 1
+
+            row = storage.Row(rid, txid, 0, storage.encode_row(self.store.tables[ti].columns, row_vals, row_nulls))
+            wal_recs.append(self.store._serialize_row(self.store.tables[ti].name, row))
+            ridx = self.store.tables[ti].append_row(row)
+            inserted_idxs.append(ridx)
+            if not p.match_op(","):
+                break
+
+        # Optional ON CONFLICT ... DO NOTHING
+        if p.match_kw("ON"):
+            p.match_kw("CONFLICT")
+            while p.peek_kind() != "EOF":
+                if p.peek_kind() == "IDENT" and p.peek_upper() == "RETURNING":
+                    break
+                if p.peek_kind() == "OP" and p.peek_val() == ";":
+                    break
+                p.step()
+
+        self._commit_records(wal_recs)
+
+        ret_cols: list[str] = []
+        ret_rows: list[list[str]] = []
+        if p.match_kw("RETURNING"):
+            if p.match_op("*"):
+                ci = 0
+                while ci < len(self.store.tables[ti].columns):
+                    ret_cols.append(self.store.tables[ti].columns[ci].name.copy())
+                    ci += 1
+            else:
+                while p.peek_kind() != "EOF" and not (p.peek_kind() == "OP" and p.peek_val() == ";"):
+                    ret_cols.append(p.expect_ident())
+                    if not p.match_op(","):
+                        break
+            ri = 0
+            while ri < len(inserted_idxs):
+                ridx = inserted_idxs[ri]
+                ret_rows.append(self._project_row(self.store.tables[ti], self.store.tables[ti].rows[ridx], ret_cols))
+                ri += 1
+
+        return QueryResult(ret_cols, ret_rows, "INSERT 0 " + str(len(inserted_idxs)), len(inserted_idxs))
+
+    def _exec_select(self, p: _Parser) -> QueryResult:
+        self.in_tx = self.in_tx
+        # Handle PostgreSQL/Django probe queries: SELECT version(), SELECT 1, etc.
+        if p.peek_kind() == "IDENT" and p.peek_upper() == "VERSION":
+            return QueryResult(["version"], [["PostgreSQL 16.0 (StrictQL 0.1)"]], "SELECT 1", 1)
+        if p.peek_kind() == "NUMBER":
+            v = p.peek_val()
+            p.step()
+            return QueryResult(["?column?"], [[v]], "SELECT 1", 1)
+
+        distinct = p.match_kw("DISTINCT")
+        aggs: list[_AggSpec] = []
+        proj_all = False
+        proj_tbls: list[str] = []
+        proj_cols: list[str] = []
+        proj_aliases: list[str] = []
+        if p.match_op("*"):
+            proj_all = True
+        else:
+            while p.peek_kind() != "EOF":
+                if p.peek_kind() == "IDENT" and p.peek_upper() == "FROM":
+                    break
+                pu = p.peek_upper() if p.peek_kind() == "IDENT" else ""
+                if (pu == "COUNT" or pu == "SUM" or pu == "MAX" or pu == "MIN") and p.pos + 1 < len(p.tokens) and p.tokens[p.pos + 1].kind == "OP" and p.tokens[p.pos + 1].value == "(":
+                    fn = pu
+                    p.step()
+                    p.expect_op("(")
+                    acol = "*"
+                    if p.match_op("*"):
+                        acol = "*"
+                    else:
+                        acol = p.expect_ident()
+                        if p.match_op("."):
+                            acol = p.expect_ident()
+                    p.expect_op(")")
+                    aalias = fn.lower()
+                    if p.match_kw("AS"):
+                        aalias = p.expect_ident()
+                    elif p.peek_kind() == "IDENT" and p.peek_upper() != "FROM":
+                        aalias = p.expect_ident()
+                    aggs.append(_AggSpec(fn, acol, aalias))
+                    p.match_op(",")
+                else:
+                    pt = ""
+                    cn = p.expect_ident()
+                    if p.match_op("."):
+                        pt = cn
+                        cn = p.expect_ident()
+                    al = cn.copy()
+                    if p.match_kw("AS"):
+                        al = p.expect_ident()
+                    proj_tbls.append(pt)
+                    proj_cols.append(cn)
+                    proj_aliases.append(al)
+                    p.match_op(",")
+
+        if not p.match_kw("FROM"):
+            raise "SyntaxError: expected FROM in SELECT"
+        tname = p.expect_ident()
+        if p.match_op("."):
+            schema = tname.lower()
+            tname = p.expect_ident()
+            if schema == "information_schema" and tname.lower() == "tables":
+                if not self.in_tx:
+                    self.store.reload()
+                rows_out: list[list[str]] = []
+                ti = 0
+                while ti < len(self.store.tables):
+                    rows_out.append([self.store.tables[ti].name.copy()])
+                    ti += 1
+                n_rows = len(rows_out)
+                return QueryResult(["table_name"], rows_out, "SELECT " + str(n_rows), n_rows)
+
+        # Optional table alias
+        base_alias = tname.copy()
+        if p.match_kw("AS"):
+            base_alias = p.expect_ident()
+        elif p.peek_kind() == "IDENT":
+            nu = p.peek_upper()
+            if nu != "WHERE" and nu != "ORDER" and nu != "LIMIT" and nu != "OFFSET" and nu != "INNER" and nu != "LEFT" and nu != "JOIN" and nu != "GROUP":
+                base_alias = p.expect_ident()
+
+        # Optional INNER JOIN / LEFT [OUTER] JOIN clauses
+        joins: list[_JoinSpec] = []
+        while p.peek_kind() == "IDENT":
+            ju = p.peek_upper()
+            if ju != "INNER" and ju != "LEFT" and ju != "JOIN":
+                break
+            is_left = False
+            if ju == "LEFT":
+                is_left = True
+                p.step()
+                p.match_kw("OUTER")
+                p.match_kw("JOIN")
+            elif ju == "INNER":
+                p.step()
+                p.match_kw("JOIN")
+            else:
+                p.step()
+            jtname = p.expect_ident()
+            if p.match_op("."):
+                jtname = p.expect_ident()
+            jalias = jtname.copy()
+            if p.match_kw("AS"):
+                jalias = p.expect_ident()
+            elif p.peek_kind() == "IDENT" and p.peek_upper() != "ON":
+                jalias = p.expect_ident()
+            if not p.match_kw("ON"):
+                raise "SyntaxError: expected ON in JOIN"
+            la = ""
+            lc = p.expect_ident()
+            if p.match_op("."):
+                la = lc
+                lc = p.expect_ident()
+            p.expect_op("=")
+            ra = ""
+            rc = p.expect_ident()
+            if p.match_op("."):
+                ra = rc
+                rc = p.expect_ident()
+            joins.append(_JoinSpec(is_left, jtname, jalias, la, lc, ra, rc))
+
+        if not self.in_tx:
+            self.store.reload()
+        ti = self.store.find_table(tname)
+        if ti < 0:
+            raise f"TableError: relation '{tname}' does not exist"
+
+        if proj_all:
+            ci = 0
+            while ci < len(self.store.tables[ti].columns):
+                proj_tbls.append("")
+                proj_cols.append(self.store.tables[ti].columns[ci].name.copy())
+                proj_aliases.append(self.store.tables[ti].columns[ci].name.copy())
+                ci += 1
+
+        where_pos = -1
+        if p.match_kw("WHERE"):
+            where_pos = p.pos
+            self._skip_where_clause(p)
+
+        order_tbls: list[str] = []
+        order_cols: list[str] = []
+        order_descs: list[bool] = []
+        if p.match_kw("ORDER"):
+            p.match_kw("BY")
+            while p.peek_kind() != "EOF":
+                ot = ""
+                oc = p.expect_ident()
+                if p.match_op("."):
+                    ot = oc
+                    oc = p.expect_ident()
+                od = False
+                if p.match_kw("DESC"):
+                    od = True
+                else:
+                    p.match_kw("ASC")
+                order_tbls.append(ot)
+                order_cols.append(oc)
+                order_descs.append(od)
+                if not p.match_op(","):
+                    break
+
+        limit_n = -1
+        offset_n = 0
+        if p.match_kw("LIMIT"):
+            limit_n = int(p.parse_literal().value)
+        if p.match_kw("OFFSET"):
+            offset_n = int(p.parse_literal().value)
+
+        if len(joins) > 0:
+            return self._exec_select_join(p, ti, base_alias, joins, proj_tbls, proj_cols, proj_aliases, aggs, distinct, where_pos, order_tbls, order_cols, order_descs, limit_n, offset_n)
+
+        snap = self.tx_id if self.in_tx else self.store.current_txid()
+        matched: list[int] = []
+        used_idx = False
+
+        # Index fast-path for SELECT DISTINCT col FROM tbl (no WHERE)
+        if distinct and where_pos < 0 and len(proj_cols) == 1:
+            dci = self.store.tables[ti].col_index(proj_cols[0])
+            dislot = self.store.tables[ti].find_index(dci) if dci >= 0 else -1
+            if dislot >= 0:
+                dkeys: list[str] = []
+                for dk in self.store.tables[ti].indexes[dislot].buckets:
+                    bkt = self.store.tables[ti].indexes[dislot].buckets[dk]
+                    bi = 0
+                    vis = False
+                    while bi < len(bkt):
+                        if self.store.tables[ti].rows[bkt[bi]].is_visible(snap):
+                            vis = True
+                            break
+                        bi += 1
+                    if vis:
+                        dkeys.append(dk.copy())
+                if len(order_cols) == 1 and order_cols[0].lower() == proj_cols[0].lower() and len(dkeys) > 1:
+                    didxs: list[int] = []
+                    di = 0
+                    while di < len(dkeys):
+                        didxs.append(di)
+                        di += 1
+                    _qsort_str(didxs, dkeys, 0, len(dkeys) - 1, order_descs[0])
+                out_d: list[list[str]] = []
+                di = offset_n
+                while di < len(dkeys):
+                    if limit_n >= 0 and len(out_d) >= limit_n:
+                        break
+                    out_d.append([dkeys[di].copy()])
+                    di += 1
+                nd = len(out_d)
+                return QueryResult(proj_cols, out_d, "SELECT " + str(nd), nd)
+
+        # Index fast-path for simple WHERE col = lit or WHERE col IN (...)
+        if where_pos >= 0:
+            saved_p = p.pos
+            p.pos = where_pos
+            if p.peek_kind() == "IDENT":
+                wcol = p.expect_ident()
+                if p.match_op("."):
+                    wcol = p.expect_ident()
+                wci = self.store.tables[ti].col_index(wcol)
+                islot = self.store.tables[ti].find_index(wci) if wci >= 0 else -1
+                if islot >= 0:
+                    if p.match_op("="):
+                        wlit = p.parse_literal()
+                        # Only use index fast-path if no AND/OR follows
+                        nxt = p.peek_upper() if p.peek_kind() == "IDENT" else ""
+                        if nxt != "AND" and nxt != "OR":
+                            used_idx = True
+                            if not wlit.is_null and wlit.value in self.store.tables[ti].indexes[islot].buckets:
+                                bkt = self.store.tables[ti].indexes[islot].buckets[wlit.value]
+                                bi = 0
+                                while bi < len(bkt):
+                                    ridx = bkt[bi]
+                                    if self.store.tables[ti].rows[ridx].is_visible(snap):
+                                        matched.append(ridx)
+                                    bi += 1
+                    elif p.match_kw("IN"):
+                        if p.match_op("("):
+                            keys: list[str] = []
+                            if p.match_kw("SELECT"):
+                                sub_res = self._exec_select(p)
+                                p.match_op(")")
+                                si = 0
+                                while si < len(sub_res.rows):
+                                    if len(sub_res.rows[si]) > 0 and sub_res.rows[si][0] != "NULL":
+                                        keys.append(sub_res.rows[si][0].copy())
+                                    si += 1
+                            else:
+                                while not p.match_op(")"):
+                                    wlit = p.parse_literal()
+                                    if not wlit.is_null:
+                                        keys.append(wlit.value.copy())
+                                    p.match_op(",")
+                            nxt = p.peek_upper() if p.peek_kind() == "IDENT" else ""
+                            if nxt != "AND" and nxt != "OR":
+                                used_idx = True
+                                ki = 0
+                                while ki < len(keys):
+                                    if keys[ki] in self.store.tables[ti].indexes[islot].buckets:
+                                        bkt = self.store.tables[ti].indexes[islot].buckets[keys[ki]]
+                                        bi = 0
+                                        while bi < len(bkt):
+                                            ridx = bkt[bi]
+                                            if self.store.tables[ti].rows[ridx].is_visible(snap):
+                                                matched.append(ridx)
+                                            bi += 1
+                                    ki += 1
+            p.pos = saved_p
+
+        tbl = self.store.tables[ti]
+
+        if not used_idx:
+            # Fast-path for simple WHERE col ILIKE/LIKE lit (parse once instead of per-row)
+            fast_like_ci = -1
+            fast_like_pat = ""
+            fast_like_icase = False
+            if where_pos >= 0:
+                saved_p2 = p.pos
+                p.pos = where_pos
+                if p.peek_kind() == "IDENT":
+                    wcol2 = p.expect_ident()
+                    if p.match_op("."):
+                        wcol2 = p.expect_ident()
+                    wci2 = tbl.col_index(wcol2)
+                    if wci2 >= 0 and (p.match_kw("ILIKE") or p.match_kw("LIKE")):
+                        is_ic = (p.tokens[p.pos - 1].value.upper() == "ILIKE")
+                        wlit2 = p.parse_literal()
+                        nxt2 = p.peek_upper() if p.peek_kind() == "IDENT" else ""
+                        if nxt2 != "AND" and nxt2 != "OR" and not wlit2.is_null:
+                            fast_like_ci = wci2
+                            fast_like_pat = wlit2.value.copy()
+                            fast_like_icase = is_ic
+                p.pos = saved_p2
+
+            if fast_like_ci >= 0:
+                use_fast_sub = _is_simple_contains_pat(fast_like_pat)
+                needle = fast_like_pat[1:len(fast_like_pat) - 1] if use_fast_sub else ""
+                early_cap = (offset_n + limit_n) if (len(order_cols) == 0 and not distinct and limit_n >= 0) else -1
+                ri = 0
+                while ri < len(tbl.rows):
+                    row = tbl.rows[ri]
+                    if row.is_visible(snap) and not row.is_null(fast_like_ci):
+                        rv_s = row.get_str(fast_like_ci)
+                        hit = _contains_bytes(rv_s, needle, fast_like_icase) if use_fast_sub else _like_match(rv_s.copy(), fast_like_pat.copy(), fast_like_icase)
+                        if hit:
+                            matched.append(ri)
+                            if early_cap >= 0 and len(matched) >= early_cap:
+                                break
+                    ri += 1
+            else:
+                ri = 0
+                while ri < len(tbl.rows):
+                    row = tbl.rows[ri]
+                    if row.is_visible(snap):
+                        if self._row_matches_where(p, where_pos, tbl, row):
+                            matched.append(ri)
+                    ri += 1
+
+        if len(aggs) > 0:
+            agg_cols: list[str] = []
+            agg_vals: list[str] = []
+            ai = 0
+            while ai < len(aggs):
+                ag = aggs[ai]
+                agg_cols.append(ag.alias.copy())
+                if ag.fn == "COUNT":
+                    if ag.col == "*":
+                        agg_vals.append(str(len(matched)))
+                    else:
+                        aci = tbl.col_index(ag.col)
+                        cnt = 0
+                        mi = 0
+                        while mi < len(matched):
+                            if aci >= 0 and not tbl.rows[matched[mi]].is_null(aci):
+                                cnt += 1
+                            mi += 1
+                        agg_vals.append(str(cnt))
+                elif ag.fn == "SUM":
+                    aci = tbl.col_index(ag.col)
+                    total = 0.0
+                    mi = 0
+                    while mi < len(matched):
+                        if aci >= 0 and not tbl.rows[matched[mi]].is_null(aci):
+                            total += tbl.rows[matched[mi]].get_float(aci)
+                        mi += 1
+                    agg_vals.append(str(total))
+                elif ag.fn == "MAX" or ag.fn == "MIN":
+                    aci = tbl.col_index(ag.col)
+                    best = ""
+                    has_best = False
+                    mi = 0
+                    while mi < len(matched):
+                        if aci >= 0 and not tbl.rows[matched[mi]].is_null(aci):
+                            v = tbl.rows[matched[mi]].get_str(aci)
+                            if not has_best:
+                                best = v.copy()
+                                has_best = True
+                            else:
+                                c = _cmp_values(v, best)
+                                if (ag.fn == "MAX" and c > 0) or (ag.fn == "MIN" and c < 0):
+                                    best = v.copy()
+                        mi += 1
+                    agg_vals.append(best if has_best else "NULL")
+                ai += 1
+            return QueryResult(agg_cols, [agg_vals], "SELECT 1", 1)
+
+        # Sort if ORDER BY specified
+        if len(order_cols) == 1 and len(matched) > 1:
+            oci = tbl.col_index(order_cols[0])
+            if oci >= 0:
+                if _is_numeric_col_type(tbl.columns[oci].col_type):
+                    fkeys: list[f64] = []
+                    ki = 0
+                    while ki < len(matched):
+                        fkeys.append(tbl.rows[matched[ki]].get_float(oci))
+                        ki += 1
+                    _qsort_f64(matched, fkeys, 0, len(matched) - 1, order_descs[0])
+                else:
+                    skeys: list[str] = []
+                    ki = 0
+                    while ki < len(matched):
+                        skeys.append(tbl.rows[matched[ki]].get_str(oci))
+                        ki += 1
+                    _qsort_str(matched, skeys, 0, len(matched) - 1, order_descs[0])
+        elif len(order_cols) > 1:
+            order_cidxs: list[int] = []
+            oi = 0
+            while oi < len(order_cols):
+                order_cidxs.append(tbl.col_index(order_cols[oi]))
+                oi += 1
+            i = 1
+            while i < len(matched):
+                j = i
+                while j > 0:
+                    swap = False
+                    k = 0
+                    while k < len(order_cidxs):
+                        oci = order_cidxs[k]
+                        if oci >= 0:
+                            c = _cmp_values(tbl.rows[matched[j - 1]].get_str(oci), tbl.rows[matched[j]].get_str(oci))
+                            if c != 0:
+                                swap = (c < 0) if order_descs[k] else (c > 0)
+                                break
+                        k += 1
+                    if swap:
+                        tmp = matched[j - 1]
+                        matched[j - 1] = matched[j]
+                        matched[j] = tmp
+                        j -= 1
+                    else:
+                        break
+                i += 1
+
+        proj_cidxs: list[int] = []
+        pi = 0
+        while pi < len(proj_cols):
+            pci = tbl.col_index(proj_cols[pi])
+            if pci < 0:
+                raise f"ColumnError: column '{proj_cols[pi]}' does not exist"
+            proj_cidxs.append(pci)
+            pi += 1
+
+        out_rows: list[list[str]] = []
+        ncols = len(proj_cidxs)
+        if not distinct:
+            end_mi = len(matched)
+            if limit_n >= 0 and offset_n + limit_n < end_mi:
+                end_mi = offset_n + limit_n
+            mi = offset_n
+            while mi < end_mi:
+                mrow = tbl.rows[matched[mi]]
+                prow: list[str] = []
+                ci = 0
+                while ci < ncols:
+                    cidx = proj_cidxs[ci]
+                    prow.append("NULL" if mrow.is_null(cidx) else mrow.get_str(cidx))
+                    ci += 1
+                out_rows.append(prow)
+                mi += 1
+        else:
+            seen_keys: dict[str, bool] = {}
+            kept = 0
+            mi = 0
+            while mi < len(matched):
+                mrow = tbl.rows[matched[mi]]
+                prow: list[str] = []
+                ci = 0
+                while ci < ncols:
+                    cidx = proj_cidxs[ci]
+                    prow.append("NULL" if mrow.is_null(cidx) else mrow.get_str(cidx))
+                    ci += 1
+                key = prow[0].copy() if ncols == 1 else "\t".join(prow)
+                if not (key in seen_keys):
+                    seen_keys[key] = True
+                    if kept >= offset_n:
+                        out_rows.append(prow)
+                        if limit_n >= 0 and len(out_rows) >= limit_n:
+                            break
+                    kept += 1
+                mi += 1
+
+        n_out = len(out_rows)
+        return QueryResult(proj_aliases, out_rows, "SELECT " + str(n_out), n_out)
+
+    def _exec_select_join(
+        self,
+        p: _Parser,
+        base_ti: int,
+        base_alias: str,
+        joins: list[_JoinSpec],
+        proj_tbls: list[str],
+        proj_cols: list[str],
+        proj_aliases: list[str],
+        aggs: list[_AggSpec],
+        distinct: bool,
+        where_pos: int,
+        order_tbls: list[str],
+        order_cols: list[str],
+        order_descs: list[bool],
+        limit_n: int,
+        offset_n: int,
+    ) -> QueryResult:
+        snap = self.tx_id if self.in_tx else self.store.current_txid()
+
+        # Build table index & alias arrays: slot 0 = base table, slots 1..N = joined tables
+        slot_tis: list[int] = [base_ti]
+        slot_aliases: list[str] = [base_alias.lower()]
+        ji = 0
+        while ji < len(joins):
+            jti = self.store.find_table(joins[ji].table_name)
+            if jti < 0:
+                raise f"TableError: relation '{joins[ji].table_name}' does not exist"
+            slot_tis.append(jti)
+            slot_aliases.append(joins[ji].alias.lower())
+            ji += 1
+
+        # 1. Filter base table rows (using index / ILIKE fast-paths when applicable)
+        base_matched: list[int] = []
+        used_idx = False
+        if where_pos >= 0:
+            saved_p = p.pos
+            p.pos = where_pos
+            if p.peek_kind() == "IDENT":
+                wcol = p.expect_ident()
+                if p.match_op("."):
+                    wcol = p.expect_ident()
+                wci = self.store.tables[base_ti].col_index(wcol)
+                islot = self.store.tables[base_ti].find_index(wci) if wci >= 0 else -1
+                if wci >= 0 and p.match_kw("IN") and p.match_op("("):
+                    keys: list[str] = []
+                    if p.match_kw("SELECT"):
+                        sub_res = self._exec_select(p)
+                        p.match_op(")")
+                        si = 0
+                        while si < len(sub_res.rows):
+                            if len(sub_res.rows[si]) > 0 and sub_res.rows[si][0] != "NULL":
+                                keys.append(sub_res.rows[si][0].copy())
+                            si += 1
+                    else:
+                        while not p.match_op(")"):
+                            wlit = p.parse_literal()
+                            if not wlit.is_null:
+                                keys.append(wlit.value.copy())
+                            p.match_op(",")
+                    nxt = p.peek_upper() if p.peek_kind() == "IDENT" else ""
+                    if nxt != "AND" and nxt != "OR":
+                        used_idx = True
+                        if islot >= 0:
+                            ki = 0
+                            while ki < len(keys):
+                                if keys[ki] in self.store.tables[base_ti].indexes[islot].buckets:
+                                    bkt = self.store.tables[base_ti].indexes[islot].buckets[keys[ki]]
+                                    bi = 0
+                                    while bi < len(bkt):
+                                        ridx = bkt[bi]
+                                        if self.store.tables[base_ti].rows[ridx].is_visible(snap):
+                                            base_matched.append(ridx)
+                                        bi += 1
+                                ki += 1
+                        else:
+                            kset: dict[str, bool] = {}
+                            ki = 0
+                            while ki < len(keys):
+                                kset[keys[ki].copy()] = True
+                                ki += 1
+                            ri = 0
+                            while ri < len(self.store.tables[base_ti].rows):
+                                r = self.store.tables[base_ti].rows[ri]
+                                if r.is_visible(snap) and not r.is_null(wci) and (r.get_str(wci) in kset):
+                                    base_matched.append(ri)
+                                ri += 1
+                elif islot >= 0 and p.match_op("="):
+                    wlit = p.parse_literal()
+                    nxt = p.peek_upper() if p.peek_kind() == "IDENT" else ""
+                    if nxt != "AND" and nxt != "OR":
+                        used_idx = True
+                        if not wlit.is_null and wlit.value in self.store.tables[base_ti].indexes[islot].buckets:
+                            bkt = self.store.tables[base_ti].indexes[islot].buckets[wlit.value]
+                            bi = 0
+                            while bi < len(bkt):
+                                ridx = bkt[bi]
+                                if self.store.tables[base_ti].rows[ridx].is_visible(snap):
+                                    base_matched.append(ridx)
+                                bi += 1
+            p.pos = saved_p
+
+        tbl = self.store.tables[base_ti]
+
+        if not used_idx:
+            fast_like_ci = -1
+            fast_like_pat = ""
+            fast_like_icase = False
+            if where_pos >= 0:
+                saved_p2 = p.pos
+                p.pos = where_pos
+                if p.peek_kind() == "IDENT":
+                    wcol2 = p.expect_ident()
+                    if p.match_op("."):
+                        wcol2 = p.expect_ident()
+                    wci2 = tbl.col_index(wcol2)
+                    if wci2 >= 0 and (p.match_kw("ILIKE") or p.match_kw("LIKE")):
+                        is_ic = (p.tokens[p.pos - 1].value.upper() == "ILIKE")
+                        wlit2 = p.parse_literal()
+                        nxt2 = p.peek_upper() if p.peek_kind() == "IDENT" else ""
+                        if nxt2 != "AND" and nxt2 != "OR" and not wlit2.is_null:
+                            fast_like_ci = wci2
+                            fast_like_pat = wlit2.value.copy()
+                            fast_like_icase = is_ic
+                p.pos = saved_p2
+
+            if fast_like_ci >= 0:
+                use_fast_sub = _is_simple_contains_pat(fast_like_pat)
+                needle = fast_like_pat[1:len(fast_like_pat) - 1] if use_fast_sub else ""
+                ri = 0
+                while ri < len(tbl.rows):
+                    row = tbl.rows[ri]
+                    if row.is_visible(snap) and not row.is_null(fast_like_ci):
+                        rv_s = row.get_str(fast_like_ci)
+                        hit = _contains_bytes(rv_s, needle, fast_like_icase) if use_fast_sub else _like_match(rv_s.copy(), fast_like_pat.copy(), fast_like_icase)
+                        if hit:
+                            base_matched.append(ri)
+                    ri += 1
+            else:
+                ri = 0
+                while ri < len(tbl.rows):
+                    if tbl.rows[ri].is_visible(snap):
+                        if self._row_matches_where(p, where_pos, tbl, tbl.rows[ri]):
+                            base_matched.append(ri)
+                    ri += 1
+
+        # Sort base rows before joining if single ORDER BY is on base table (enables early LIMIT!)
+        sorted_early = False
+        if len(order_cols) == 1 and (order_tbls[0] == "" or order_tbls[0].lower() == slot_aliases[0]):
+            oci = tbl.col_index(order_cols[0])
+            if oci >= 0:
+                sorted_early = True
+                if len(base_matched) > 1:
+                    if _is_numeric_col_type(tbl.columns[oci].col_type):
+                        fkeys: list[f64] = []
+                        ki = 0
+                        while ki < len(base_matched):
+                            fkeys.append(tbl.rows[base_matched[ki]].get_float(oci))
+                            ki += 1
+                        _qsort_f64(base_matched, fkeys, 0, len(base_matched) - 1, order_descs[0])
+                    else:
+                        skeys: list[str] = []
+                        ki = 0
+                        while ki < len(base_matched):
+                            skeys.append(tbl.rows[base_matched[ki]].get_str(oci))
+                            ki += 1
+                        _qsort_str(base_matched, skeys, 0, len(base_matched) - 1, order_descs[0])
+
+        # 2. Execute hash joins
+        tuples: list[list[int]] = []
+        bi = 0
+        while bi < len(base_matched):
+            tuples.append([base_matched[bi]])
+            bi += 1
+
+        ji = 0
+        while ji < len(joins):
+            js = joins[ji]
+            dst_slot = ji + 1
+            dst_ti = slot_tis[dst_slot]
+            dst_tbl = self.store.tables[dst_ti]
+            dst_alias = slot_aliases[dst_slot]
+
+            # Determine which side of ON references dst_alias vs an earlier slot
+            src_slot = 0
+            src_col = js.left_col
+            dst_col = js.right_col
+            if js.left_alias.lower() == dst_alias:
+                dst_col = js.left_col
+                src_col = js.right_col
+                si = 0
+                while si < dst_slot:
+                    if slot_aliases[si] == js.right_alias.lower():
+                        src_slot = si
+                        break
+                    si += 1
+            else:
+                si = 0
+                while si < dst_slot:
+                    if slot_aliases[si] == js.left_alias.lower():
+                        src_slot = si
+                        break
+                    si += 1
+
+            src_tbl = self.store.tables[slot_tis[src_slot]]
+            src_ci = src_tbl.col_index(src_col)
+            dst_ci = dst_tbl.col_index(dst_col)
+            if src_ci < 0 or dst_ci < 0:
+                raise f"ColumnError: join column '{src_col}' or '{dst_col}' not found"
+
+            dst_islot = dst_tbl.find_index(dst_ci)
+            # Build ad-hoc hash map if dst_tbl has no index on dst_ci
+            adhoc: dict[str, list[int]] = {}
+            if dst_islot < 0:
+                dri = 0
+                while dri < len(dst_tbl.rows):
+                    drow = dst_tbl.rows[dri]
+                    if drow.is_visible(snap) and not drow.is_null(dst_ci):
+                        dk = drow.get_str(dst_ci)
+                        if dk in adhoc:
+                            adhoc[dk].append(dri)
+                        else:
+                            adhoc[dk.copy()] = [dri]
+                    dri += 1
+
+            next_tuples: list[list[int]] = []
+            ti_idx = 0
+            while ti_idx < len(tuples):
+                tup = tuples[ti_idx]
+                s_ridx = tup[src_slot]
+                matched_any = False
+                if s_ridx >= 0 and not src_tbl.rows[s_ridx].is_null(src_ci):
+                    jkey = src_tbl.rows[s_ridx].get_str(src_ci)
+                    if dst_islot >= 0:
+                        if jkey in dst_tbl.indexes[dst_islot].buckets:
+                            bkt = dst_tbl.indexes[dst_islot].buckets[jkey]
+                            k = 0
+                            while k < len(bkt):
+                                dr = bkt[k]
+                                if dst_tbl.rows[dr].is_visible(snap):
+                                    nt = tup.copy()
+                                    nt.append(dr)
+                                    next_tuples.append(nt)
+                                    matched_any = True
+                                k += 1
+                    else:
+                        if jkey in adhoc:
+                            bkt = adhoc[jkey]
+                            k = 0
+                            while k < len(bkt):
+                                nt = tup.copy()
+                                nt.append(bkt[k])
+                                next_tuples.append(nt)
+                                matched_any = True
+                                k += 1
+                if not matched_any and js.is_left:
+                    nt = tup.copy()
+                    nt.append(-1)
+                    next_tuples.append(nt)
+                ti_idx += 1
+            tuples = next_tuples
+            ji += 1
+
+        # 3. Resolve projections
+        p_slots: list[int] = []
+        p_cidxs: list[int] = []
+        pi = 0
+        while pi < len(proj_cols):
+            pt = proj_tbls[pi].lower()
+            pc = proj_cols[pi]
+            found_slot = -1
+            found_ci = -1
+            if len(pt) > 0:
+                si = 0
+                while si < len(slot_aliases):
+                    if slot_aliases[si] == pt:
+                        found_slot = si
+                        found_ci = self.store.tables[slot_tis[si]].col_index(pc)
+                        break
+                    si += 1
+            else:
+                si = 0
+                while si < len(slot_tis):
+                    ci_try = self.store.tables[slot_tis[si]].col_index(pc)
+                    if ci_try >= 0:
+                        found_slot = si
+                        found_ci = ci_try
+                        break
+                    si += 1
+            if found_slot < 0 or found_ci < 0:
+                raise f"ColumnError: column '{pc}' does not exist"
+            p_slots.append(found_slot)
+            p_cidxs.append(found_ci)
+            pi += 1
+
+        # 4. Project + OFFSET/LIMIT
+        out_rows: list[list[str]] = []
+        idx = offset_n
+        while idx < len(tuples):
+            if limit_n >= 0 and len(out_rows) >= limit_n:
+                break
+            tup = tuples[idx]
+            prow: list[str] = []
+            ci = 0
+            while ci < len(p_slots):
+                sl = p_slots[ci]
+                cidx = p_cidxs[ci]
+                ridx = tup[sl]
+                if ridx < 0:
+                    prow.append("NULL")
+                else:
+                    row = self.store.tables[slot_tis[sl]].rows[ridx]
+                    prow.append("NULL" if row.is_null(cidx) else row.get_str(cidx))
+                ci += 1
+            out_rows.append(prow)
+            idx += 1
+
+        n_out = len(out_rows)
+        return QueryResult(proj_aliases, out_rows, "SELECT " + str(n_out), n_out)
+
+    def _exec_update(self, p: _Parser) -> QueryResult:
+        tname = p.expect_ident()
+        if p.match_op("."):
+            tname = p.expect_ident()
+        if not p.match_kw("SET"):
+            raise "SyntaxError: expected SET in UPDATE"
+
+        set_cols: list[str] = []
+        set_nulls: list[bool] = []
+        set_vals: list[str] = []
+        while True:
+            cn = p.expect_ident()
+            p.expect_op("=")
+            lit = p.parse_literal()
+            set_cols.append(cn)
+            set_nulls.append(lit.is_null)
+            set_vals.append(lit.value.copy())
+            if not p.match_op(","):
+                break
+
+        where_pos = -1
+        if p.match_kw("WHERE"):
+            where_pos = p.pos
+            self._skip_where_clause(p)
+
+        if not self.in_tx:
+            self.store.reload()
+        ti = self.store.find_table(tname)
+        if ti < 0:
+            raise f"TableError: relation '{tname}' does not exist"
+
+        txid = self._begin_auto_tx()
+        snap = txid
+        wal_recs: list[str] = []
+        updated_count = 0
+        ri = 0
+        orig_len = len(self.store.tables[ti].rows)
+        while ri < orig_len:
+            if self.store.tables[ti].rows[ri].is_visible(snap) and self._row_matches_where(p, where_pos, self.store.tables[ti], self.store.tables[ti].rows[ri]):
+                # Mark old version deleted (MVCC)
+                self.store.tables[ti].rows[ri].xmax = txid
+                wal_recs.append("DEL\t" + storage._escape_field(self.store.tables[ti].name) + "\t" + str(self.store.tables[ti].rows[ri].row_id) + "\t" + str(txid))
+                # Create new version
+                new_cells: list[int | float | str | bool | None] = []
+                ci = 0
+                while ci < len(self.store.tables[ti].columns):
+                    new_cells.append(storage.clone_cell(self.store.tables[ti].rows[ri].cells[ci]))
+                    ci += 1
+                si = 0
+                while si < len(set_cols):
+                    uci = self.store.tables[ti].col_index(set_cols[si])
+                    if uci < 0:
+                        raise f"ColumnError: column '{set_cols[si]}' does not exist"
+                    uct = self.store.tables[ti].columns[uci].col_type.copy()
+                    new_cells[uci] = storage.encode_cell(uct, set_vals[si], set_nulls[si])
+                    si += 1
+                new_rid = self.store.tables[ti].next_seq
+                self.store.tables[ti].next_seq += 1
+                new_row = storage.Row(new_rid, txid, 0, new_cells)
+                wal_recs.append(self.store._serialize_row(self.store.tables[ti].name, new_row))
+                self.store.tables[ti].rows.append(new_row)
+                updated_count += 1
+            ri += 1
+
+        self._commit_records(wal_recs)
+        return QueryResult([], [], "UPDATE " + str(updated_count), updated_count)
+
+    def _exec_delete(self, p: _Parser) -> QueryResult:
+        if not p.match_kw("FROM"):
+            raise "SyntaxError: expected FROM after DELETE"
+        tname = p.expect_ident()
+        if p.match_op("."):
+            tname = p.expect_ident()
+        where_pos = -1
+        if p.match_kw("WHERE"):
+            where_pos = p.pos
+            self._skip_where_clause(p)
+
+        if not self.in_tx:
+            self.store.reload()
+        ti = self.store.find_table(tname)
+        if ti < 0:
+            raise f"TableError: relation '{tname}' does not exist"
+
+        txid = self._begin_auto_tx()
+        snap = txid
+        wal_recs: list[str] = []
+        del_count = 0
+        ri = 0
+        while ri < len(self.store.tables[ti].rows):
+            if self.store.tables[ti].rows[ri].is_visible(snap) and self._row_matches_where(p, where_pos, self.store.tables[ti], self.store.tables[ti].rows[ri]):
+                self.store.tables[ti].rows[ri].xmax = txid
+                wal_recs.append("DEL\t" + storage._escape_field(self.store.tables[ti].name) + "\t" + str(self.store.tables[ti].rows[ri].row_id) + "\t" + str(txid))
+                del_count += 1
+            ri += 1
+
+        self._commit_records(wal_recs)
+        return QueryResult([], [], "DELETE " + str(del_count), del_count)
+
+    def describe_columns(self, query: str) -> list[str]:
+        self.in_tx = self.in_tx
+        tokens = sql.tokenize(query)
+        p = _Parser(tokens, [])
+        if p.match_kw("SELECT"):
+            if p.peek_kind() == "IDENT" and p.peek_upper() == "VERSION":
+                return ["version"]
+            if p.peek_kind() == "NUMBER":
+                return ["?column?"]
+            p.match_kw("DISTINCT")
+            if p.peek_kind() == "IDENT" and p.peek_upper() == "COUNT":
+                p.step()
+                if p.match_op("("):
+                    while p.peek_kind() != "EOF" and not p.match_op(")"):
+                        p.step()
+                alias = "count"
+                if p.match_kw("AS"):
+                    alias = p.expect_ident()
+                elif p.peek_kind() == "IDENT" and p.peek_upper() != "FROM":
+                    alias = p.expect_ident()
+                return [alias]
+            if p.match_op("*"):
+                if p.match_kw("FROM"):
+                    tname = p.expect_ident()
+                    if p.match_op("."):
+                        tname = p.expect_ident()
+                    if not self.in_tx:
+                        self.store.reload()
+                    ti = self.store.find_table(tname)
+                    if ti >= 0:
+                        cols: list[str] = []
+                        ci = 0
+                        while ci < len(self.store.tables[ti].columns):
+                            cols.append(self.store.tables[ti].columns[ci].name.copy())
+                            ci += 1
+                        return cols
+                return []
+            cols2: list[str] = []
+            while p.peek_kind() != "EOF":
+                if p.peek_kind() == "IDENT" and p.peek_upper() == "FROM":
+                    break
+                cn = p.expect_ident()
+                if p.match_op("."):
+                    cn = p.expect_ident()
+                if p.match_kw("AS"):
+                    cn = p.expect_ident()
+                cols2.append(cn)
+                p.match_op(",")
+            return cols2
+        return []
+
+    def _exec_cached_insert(self, plan: _InsertPlan, params: list[str]) -> QueryResult:
+        if not self.in_tx:
+            self.store.reload()
+        ti = self.store.find_table(plan.table_name)
+        if ti < 0:
+            raise f"TableError: relation '{plan.table_name}' does not exist"
+        txid = self._begin_auto_tx()
+        ncols = len(self.store.tables[ti].columns)
+        rid = self.store.tables[ti].next_seq
+        self.store.tables[ti].next_seq = rid + 1
+
+        vals: list[str] = []
+        nulls: list[bool] = []
+        ci = 0
+        while ci < ncols:
+            if self.store.tables[ti].columns[ci].is_serial:
+                vals.append(str(rid))
+                nulls.append(False)
+            else:
+                vals.append("")
+                nulls.append(True)
+            ci += 1
+
+        k = 0
+        while k < len(plan.col_cidxs):
+            cidx = plan.col_cidxs[k]
+            pidx = plan.param_idxs[k]
+            vals[cidx] = params[pidx].copy()
+            nulls[cidx] = False
+            k += 1
+
+        row = storage.Row(rid, txid, 0, storage.encode_row(self.store.tables[ti].columns, vals, nulls))
+        rec = self.store._serialize_row(self.store.tables[ti].name, row)
+        self.store.tables[ti].append_row(row)
+        self._commit_records([rec])
+        return QueryResult([], [], "INSERT 0 1", 1)
+
+    def _exec_literal_insert(self, plan: _InsertPlan, vals_in: list[str], nulls_in: list[bool]) -> QueryResult:
+        if not self.in_tx:
+            self.store.reload()
+        ti = self.store.find_table(plan.table_name)
+        if ti < 0:
+            raise f"TableError: relation '{plan.table_name}' does not exist"
+        txid = self._begin_auto_tx()
+        ncols = len(self.store.tables[ti].columns)
+        rid = self.store.tables[ti].next_seq
+        self.store.tables[ti].next_seq = rid + 1
+
+        vals: list[str] = []
+        nulls: list[bool] = []
+        ci = 0
+        while ci < ncols:
+            if self.store.tables[ti].columns[ci].is_serial:
+                vals.append(str(rid))
+                nulls.append(False)
+            else:
+                vals.append("")
+                nulls.append(True)
+            ci += 1
+
+        k = 0
+        while k < len(plan.col_cidxs):
+            cidx = plan.col_cidxs[k]
+            if not nulls_in[k]:
+                vals[cidx] = vals_in[k].copy()
+                nulls[cidx] = False
+            k += 1
+
+        row = storage.Row(rid, txid, 0, storage.encode_row(self.store.tables[ti].columns, vals, nulls))
+        rec = self.store._serialize_row(self.store.tables[ti].name, row)
+        self.store.tables[ti].append_row(row)
+        self._commit_records([rec])
+        return QueryResult([], [], "INSERT 0 1", 1)
+
+    def exec_parsed_insert(self, parsed: ParsedInsert) -> QueryResult | None:
+        if not parsed.ok:
+            return None
+        if parsed.prefix in self.ins_cache:
+            if len(self.ins_cache[parsed.prefix].col_cidxs) == len(parsed.vals):
+                return self._exec_literal_insert(self.ins_cache[parsed.prefix], parsed.vals, parsed.nulls)
+            return None
+        rest = parsed.prefix[12:len(parsed.prefix)]
+        lp = -1
+        rp = -1
+        k = 0
+        while k < len(rest):
+            if rest[k] == "(" and lp < 0:
+                lp = k
+            elif rest[k] == ")" and rp < 0:
+                rp = k
+                break
+            k += 1
+        if lp < 0 or rp < 0:
+            return None
+        tname = rest[0:lp].strip().replace("\"", "")
+        if "." in tname:
+            tname = tname.split(".")[-1]
+        ti = self.store.find_table(tname)
+        if ti < 0:
+            return None
+        col_str = rest[lp + 1:rp]
+        cparts = col_str.split(",")
+        ccidxs: list[int] = []
+        ci = 0
+        while ci < len(cparts):
+            cname = cparts[ci].strip().replace("\"", "")
+            cidx = self.store.tables[ti].col_index(cname)
+            if cidx < 0:
+                return None
+            ccidxs.append(cidx)
+            ci += 1
+        if len(ccidxs) != len(parsed.vals):
+            return None
+        plan = _InsertPlan(tname, ccidxs, [])
+        self.ins_cache[parsed.prefix.copy()] = plan
+        return self._exec_literal_insert(self.ins_cache[parsed.prefix], parsed.vals, parsed.nulls)
+
+    def _try_fast_literal_insert(self, query: str) -> QueryResult | None:
+        parsed = parse_literal_insert(query)
+        if not parsed.ok:
+            return None
+        return self.exec_parsed_insert(parsed)
+
+    def execute(self, query: str, params: list[str] = []) -> QueryResult:
+        if len(params) > 0 and query in self.ins_cache:
+            return self._exec_cached_insert(self.ins_cache[query], params)
+        if len(params) == 0:
+            fast = self._try_fast_literal_insert(query)
+            if fast is not None:
+                return fast
+        if not self.store.server_mode:
+            if query in self.tok_cache:
+                return self.execute_tokens(self.tok_cache[query].copy(), params, query)
+            tokens = sql.tokenize(query)
+            if len(self.tok_cache) < 512:
+                self.tok_cache[query.copy()] = tokens.copy()
+            return self.execute_tokens(tokens, params, query)
+        tokens = sql.tokenize(query)
+        return self.execute_tokens(tokens, params, query)
+
+    def execute_tokens(self, tokens: list[sql.Token], params: list[str] = [], query: str = "") -> QueryResult:
+        p = _Parser(tokens, params)
+        if p.peek_kind() == "EOF" or p.match_op(";"):
+            return QueryResult([], [], "", 0)
+
+        if p.match_kw("BEGIN"):
+            self.in_tx = True
+            self.tx_id = self.store.next_txid()
+            self.pending_wal = []
+            self.store.reload()
+            return QueryResult([], [], "BEGIN", 0)
+        if p.match_kw("COMMIT"):
+            if self.in_tx:
+                self.store.append_wal(self.pending_wal)
+                self.pending_wal = []
+                self.in_tx = False
+                self.tx_id = 0
+            return QueryResult([], [], "COMMIT", 0)
+        if p.match_kw("ROLLBACK"):
+            if self.in_tx:
+                self.pending_wal = []
+                self.in_tx = False
+                self.tx_id = 0
+                self.store.last_loaded_txid = 0
+                self.store.reload()
+            return QueryResult([], [], "ROLLBACK", 0)
+        if p.match_kw("SET"):
+            return QueryResult([], [], "SET", 0)
+        if p.match_kw("CREATE"):
+            if p.match_kw("TABLE"):
+                return self._exec_create_table(p)
+            p.match_kw("UNIQUE")
+            if p.match_kw("INDEX"):
+                if p.match_kw("IF"):
+                    p.match_kw("NOT")
+                    p.match_kw("EXISTS")
+                # Skip index name
+                if p.peek_kind() == "IDENT" and p.peek_upper() != "ON":
+                    p.step()
+                if p.match_kw("ON"):
+                    tname = p.expect_ident()
+                    if p.match_op("."):
+                        tname = p.expect_ident()
+                    if p.match_op("("):
+                        cname = p.expect_ident()
+                        if not self.in_tx:
+                            self.store.reload()
+                        ti = self.store.find_table(tname)
+                        if ti >= 0:
+                            ci = self.store.tables[ti].col_index(cname)
+                            if ci >= 0:
+                                self.store.tables[ti].add_index(ci)
+                                self._commit_records(["IDX\t" + storage._escape_field(self.store.tables[ti].name) + "\t" + storage._escape_field(cname)])
+                return QueryResult([], [], "CREATE INDEX", 0)
+            raise "SyntaxError: expected TABLE or INDEX after CREATE"
+        if p.match_kw("DROP"):
+            if p.match_kw("TABLE"):
+                return self._exec_drop_table(p)
+            if p.match_kw("INDEX"):
+                return self._exec_drop_index(p)
+            raise "SyntaxError: expected TABLE or INDEX after DROP"
+        if p.match_kw("ALTER"):
+            if p.match_kw("TABLE"):
+                return self._exec_alter_table(p)
+            raise "SyntaxError: expected TABLE after ALTER"
+        if p.match_kw("INSERT"):
+            # Cache simple single-row parameterized INSERT plans
+            if len(p.params) > 0:
+                saved_i = p.pos
+                if p.match_kw("INTO"):
+                    ctname = p.expect_ident()
+                    if p.match_op("."):
+                        ctname = p.expect_ident()
+                    if p.match_op("("):
+                        ccols: list[str] = []
+                        while not p.match_op(")"):
+                            ccols.append(p.expect_ident())
+                            p.match_op(",")
+                        if p.match_kw("VALUES") and p.match_op("("):
+                            pidxs: list[int] = []
+                            all_params = True
+                            while not p.match_op(")"):
+                                if p.peek_kind() == "PARAM":
+                                    pidxs.append(int(p.peek_val()) - 1)
+                                    p.step()
+                                else:
+                                    all_params = False
+                                    break
+                                p.match_op(",")
+                            if all_params and len(pidxs) == len(ccols) and not p.match_op(","):
+                                # Only cache if no RETURNING
+                                has_ret = False
+                                if p.peek_kind() == "IDENT" and p.peek_upper() == "RETURNING":
+                                    has_ret = True
+                                if not has_ret:
+                                    if not self.in_tx:
+                                        self.store.reload()
+                                    cti = self.store.find_table(ctname)
+                                    if cti >= 0:
+                                        ccidxs: list[int] = []
+                                        ok_c = True
+                                        ci = 0
+                                        while ci < len(ccols):
+                                            cidx = self.store.tables[cti].col_index(ccols[ci])
+                                            if cidx < 0:
+                                                ok_c = False
+                                                break
+                                            ccidxs.append(cidx)
+                                            ci += 1
+                                        if ok_c:
+                                            plan = _InsertPlan(ctname, ccidxs, pidxs)
+                                            self.ins_cache[query.copy()] = plan
+                                            return self._exec_cached_insert(self.ins_cache[query], p.params)
+                p.pos = saved_i
+            return self._exec_insert(p)
+        if p.match_kw("SELECT"):
+            return self._exec_select(p)
+        if p.match_kw("UPDATE"):
+            return self._exec_update(p)
+        if p.match_kw("DELETE"):
+            return self._exec_delete(p)
+        if p.match_kw("SET"):
+            # Accept PostgreSQL session SET commands (e.g. SET TIME ZONE 'UTC') as no-ops for Django
+            return QueryResult([], [], "SET", 0)
+
+        raise f"SyntaxError: unsupported SQL statement '{p.peek_val()}'"
+
+def open_db(path: str) -> Database:
+    return Database(path)

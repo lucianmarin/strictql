@@ -1,0 +1,940 @@
+# PostgreSQL v3 Wire Protocol Server (TCP)
+import engine
+import sql
+import threading
+from typing import Callable
+
+@extern("pthread_create")
+def _pg_pthread_create(tid: addr[u64], attr: addr[u8] | None, start_routine: Callable[[addr[u8]], addr[u8] | None], arg: addr[u8] | None) -> i32:
+    pass
+
+@extern("pthread_detach")
+def _pg_pthread_detach(tid: u64) -> i32:
+    pass
+
+_db_dir: str = ""
+_db_names: list[str] = []
+_db_list: list[engine.Database] = []
+_rw_list: list[threading.RWLock] = []
+_db_map_lock: threading.RWLock | None = None
+
+def _rdlock_db(idx: int) -> None:
+    if idx >= 0 and idx < len(_rw_list):
+        _rw_list[idx].acquire_read()
+
+def _wrlock_db(idx: int) -> None:
+    if idx >= 0 and idx < len(_rw_list):
+        _rw_list[idx].acquire_write()
+
+def _unlock_db(idx: int) -> None:
+    if idx >= 0 and idx < len(_rw_list):
+        _rw_list[idx].release()
+
+def _sanitize_dbname(name: str) -> str:
+    out = ""
+    i = 0
+    n = len(name)
+    while i < n:
+        ch = name[i]
+        if (ch >= "a" and ch <= "z") or (ch >= "A" and ch <= "Z") or (ch >= "0" and ch <= "9") or ch == "_" or ch == "-":
+            out += ch
+        i += 1
+    if len(out) == 0:
+        return "postgres"
+    return out
+
+def _parse_startup_db(buf: addr[u8], n: int) -> str:
+    i = 0
+    while i < n:
+        if int(val(buf + i)) == 0:
+            break
+        kstart = i
+        while i < n and int(val(buf + i)) != 0:
+            i += 1
+        key = unbin(buf + kstart)
+        i += 1
+        if i >= n:
+            break
+        vstart = i
+        while i < n and int(val(buf + i)) != 0:
+            i += 1
+        v = unbin(buf + vstart)
+        i += 1
+        if key == "database":
+            return v
+    return "postgres"
+
+def _resolve_db_idx(dbname: str) -> int:
+    if len(_db_dir) == 0:
+        return 0
+    clean = _sanitize_dbname(dbname)
+    if _db_map_lock is not None:
+        _db_map_lock.acquire_read()
+    i = 0
+    while i < len(_db_names):
+        if _db_names[i] == clean:
+            if _db_map_lock is not None:
+                _db_map_lock.release()
+            return i
+        i += 1
+    if _db_map_lock is not None:
+        _db_map_lock.release()
+        _db_map_lock.acquire_write()
+    i = 0
+    while i < len(_db_names):
+        if _db_names[i] == clean:
+            if _db_map_lock is not None:
+                _db_map_lock.release()
+            return i
+        i += 1
+    path = _db_dir + "/" + clean + ".strictql"
+    db = engine.open_db(path)
+    db.store.server_mode = True
+    idx = len(_db_list)
+    _db_names.append(clean)
+    _db_list.append(db)
+    _rw_list.append(threading.RWLock())
+    if _db_map_lock is not None:
+        _db_map_lock.release()
+    return idx
+
+def _is_read_only_query(q: str) -> bool:
+    n = len(q)
+    i = 0
+    while i < n and (q[i] == " " or q[i] == "\t" or q[i] == "\n" or q[i] == "\r"):
+        i += 1
+    if i + 6 > n:
+        return False
+    p = q[i:i + 6].upper()
+    if p != "SELECT":
+        return False
+    if i + 6 < n:
+        ch = q[i + 6]
+        if ch != " " and ch != "\t" and ch != "\n" and ch != "\r" and ch != "(":
+            return False
+    return True
+import sys
+
+@extern("socket")
+def _pg_socket(domain: i32, stype: i32, proto: i32) -> i32:
+    pass
+
+@extern("setsockopt")
+def _pg_setsockopt(fd: i32, level: i32, optname: i32, optval: addr[i32], optlen: i32) -> i32:
+    pass
+
+@extern("bind")
+def _pg_bind(fd: i32, sa: addr[u8], salen: i32) -> i32:
+    pass
+
+@extern("listen")
+def _pg_listen(fd: i32, backlog: i32) -> i32:
+    pass
+
+@extern("accept")
+def _pg_accept(fd: i32, sa: addr[u8] | None, salen: addr[i32] | None) -> i32:
+    pass
+
+@extern("recv")
+def _pg_recv(fd: i32, buf: addr[u8], length: int, flags: i32) -> int:
+    pass
+
+@extern("send")
+def _pg_send(fd: i32, buf: addr[u8], length: int, flags: i32) -> int:
+    pass
+
+@extern("close")
+def _pg_close(fd: i32) -> i32:
+    pass
+
+@extern("calloc")
+def _pg_calloc(nmemb: int, size: int) -> addr[u8]:
+    pass
+
+@extern("realloc")
+def _pg_realloc(p: addr[u8], size: int) -> addr[u8]:
+    pass
+
+@extern("free")
+def _pg_free(p: addr[u8]) -> None:
+    pass
+
+class _OutBuf:
+    buf: addr[u8]
+    length: int
+    cap: int
+
+    def __init__(self) -> None:
+        self.cap = 65536
+        self.buf = _pg_calloc(1, self.cap)
+        self.length = 0
+
+    def ensure(self, extra: int) -> None:
+        need = self.length + extra
+        if need > self.cap:
+            new_cap = self.cap * 2
+            while new_cap < need:
+                new_cap = new_cap * 2
+            self.buf = _pg_realloc(self.buf, new_cap)
+            self.cap = new_cap
+
+    def put_u8(self, v: int) -> None:
+        val(self.buf + self.length) = u8(v & 255)
+        self.length += 1
+
+    def put_i16_be(self, v: int) -> None:
+        val(self.buf + self.length) = u8((v >> 8) & 255)
+        val(self.buf + self.length + 1) = u8(v & 255)
+        self.length += 2
+
+    def put_i32_be(self, v: int) -> None:
+        val(self.buf + self.length) = u8((v >> 24) & 255)
+        val(self.buf + self.length + 1) = u8((v >> 16) & 255)
+        val(self.buf + self.length + 2) = u8((v >> 8) & 255)
+        val(self.buf + self.length + 3) = u8(v & 255)
+        self.length += 4
+
+    def put_str_raw(self, s: str) -> None:
+        src = s.bin
+        n = len(s)
+        i = 0
+        while i < n:
+            val(self.buf + self.length + i) = val(src + i)
+            i += 1
+        self.length += n
+
+    def put_cstr(self, s: str) -> None:
+        self.put_str_raw(s)
+        val(self.buf + self.length) = u8(0)
+        self.length += 1
+
+    def write_simple_tag(self, tag_byte: int) -> None:
+        self.ensure(5)
+        self.put_u8(tag_byte)
+        self.put_i32_be(4)
+
+    def write_ready_for_query(self, status_byte: int) -> None:
+        self.ensure(6)
+        self.put_u8(90) # 'Z'
+        self.put_i32_be(5)
+        self.put_u8(status_byte)
+
+    def write_param_description(self, nparams: int) -> None:
+        total = 4 + 2 + nparams * 4
+        self.ensure(1 + total)
+        self.put_u8(116) # 't'
+        self.put_i32_be(total)
+        self.put_i16_be(nparams)
+        i = 0
+        while i < nparams:
+            self.put_i32_be(25)
+            i += 1
+
+    def write_row_description(self, cols: list[str]) -> None:
+        total = 4 + 2
+        i = 0
+        while i < len(cols):
+            total += len(cols[i]) + 1 + 18
+            i += 1
+        self.ensure(1 + total)
+        self.put_u8(84) # 'T'
+        self.put_i32_be(total)
+        self.put_i16_be(len(cols))
+        i = 0
+        while i < len(cols):
+            self.put_cstr(cols[i])
+            self.put_i32_be(0)
+            self.put_i16_be(0)
+            self.put_i32_be(25)
+            self.put_i16_be(-1)
+            self.put_i32_be(-1)
+            self.put_i16_be(0)
+            i += 1
+
+    def write_rows_and_complete(self, rows: list[list[str]], tag: str) -> None:
+        total = 1 + 4 + len(tag) + 1
+        ri = 0
+        while ri < len(rows):
+            row = rows[ri]
+            rtot = 4 + 2
+            ci = 0
+            while ci < len(row):
+                if row[ci] == "NULL":
+                    rtot += 4
+                else:
+                    rtot += 4 + len(row[ci])
+                ci += 1
+            total += 1 + rtot
+            ri += 1
+        self.ensure(total)
+        ri = 0
+        while ri < len(rows):
+            row = rows[ri]
+            rtot = 4 + 2
+            ci = 0
+            while ci < len(row):
+                if row[ci] == "NULL":
+                    rtot += 4
+                else:
+                    rtot += 4 + len(row[ci])
+                ci += 1
+            self.put_u8(68) # 'D'
+            self.put_i32_be(rtot)
+            self.put_i16_be(len(row))
+            ci = 0
+            while ci < len(row):
+                if row[ci] == "NULL":
+                    self.put_i32_be(-1)
+                else:
+                    self.put_i32_be(len(row[ci]))
+                    self.put_str_raw(row[ci])
+                ci += 1
+            ri += 1
+        self.put_u8(67) # 'C'
+        self.put_i32_be(4 + len(tag) + 1)
+        self.put_cstr(tag)
+
+    def write_error(self, msg: str) -> None:
+        msg_len = 4 + 1 + 6 + 1 + len(msg) + 1 + 1
+        self.ensure(1 + msg_len)
+        self.put_u8(69) # 'E'
+        self.put_i32_be(msg_len)
+        self.put_u8(83)
+        self.put_cstr("ERROR")
+        self.put_u8(77)
+        self.put_cstr(msg)
+        self.put_u8(0)
+
+    def flush(self, fd: i32) -> None:
+        if self.length > 0:
+            _send_all(fd, self.buf, self.length)
+            self.length = 0
+
+    def destroy(self) -> None:
+        _pg_free(self.buf)
+
+def _put_u8(buf: addr[u8], off: int, v: int) -> int:
+    val(buf + off) = u8(v & 255)
+    return off + 1
+
+def _put_i16_be(buf: addr[u8], off: int, v: int) -> int:
+    val(buf + off) = u8((v >> 8) & 255)
+    val(buf + off + 1) = u8(v & 255)
+    return off + 2
+
+def _put_i32_be(buf: addr[u8], off: int, v: int) -> int:
+    val(buf + off) = u8((v >> 24) & 255)
+    val(buf + off + 1) = u8((v >> 16) & 255)
+    val(buf + off + 2) = u8((v >> 8) & 255)
+    val(buf + off + 3) = u8(v & 255)
+    return off + 4
+
+def _put_str_raw(buf: addr[u8], off: int, s: str) -> int:
+    src = s.bin
+    n = len(s)
+    i = 0
+    while i < n:
+        val(buf + off + i) = val(src + i)
+        i += 1
+    return off + n
+
+def _put_cstr(buf: addr[u8], off: int, s: str) -> int:
+    off = _put_str_raw(buf, off, s)
+    val(buf + off) = u8(0)
+    return off + 1
+
+def _get_i16_be(buf: addr[u8], off: int) -> int:
+    b0 = int(val(buf + off))
+    b1 = int(val(buf + off + 1))
+    v = (b0 << 8) | b1
+    if v >= 32768:
+        v = v - 65536
+    return v
+
+def _get_i32_be(buf: addr[u8], off: int) -> int:
+    b0 = int(val(buf + off))
+    b1 = int(val(buf + off + 1))
+    b2 = int(val(buf + off + 2))
+    b3 = int(val(buf + off + 3))
+    v = (b0 << 24) | (b1 << 16) | (b2 << 8) | b3
+    if v >= 2147483648:
+        v = v - 4294967296
+    return v
+
+def _read_cstr_len(buf: addr[u8], off: int, limit: int) -> int:
+    i = off
+    while i < limit and int(val(buf + i)) != 0:
+        i += 1
+    return i - off
+
+def _read_bytes_str(buf: addr[u8], off: int, n: int) -> str:
+    tmp = _pg_calloc(1, n + 1)
+    i = 0
+    while i < n:
+        val(tmp + i) = val(buf + off + i)
+        i += 1
+    val(tmp + n) = u8(0)
+    s = unbin(tmp)
+    _pg_free(tmp)
+    return s
+
+def _recv_exact(fd: i32, buf: addr[u8], n: int) -> bool:
+    got = 0
+    while got < n:
+        r = _pg_recv(fd, buf + got, n - got, i32(0))
+        if r <= 0:
+            return False
+        got += r
+    return True
+
+def _send_all(fd: i32, buf: addr[u8], n: int) -> bool:
+    sent = 0
+    while sent < n:
+        r = _pg_send(fd, buf + sent, n - sent, i32(0))
+        if r <= 0:
+            return False
+        sent += r
+    return True
+
+def send_auth_ok(fd: i32) -> None:
+    buf = _pg_calloc(1, 9)
+    off = _put_u8(buf, 0, 82) # 'R'
+    off = _put_i32_be(buf, off, 8)
+    off = _put_i32_be(buf, off, 0) # AuthenticationOk
+    _send_all(fd, buf, off)
+    _pg_free(buf)
+
+def send_param_status(fd: i32, name: str, value: str) -> None:
+    msg_len = 4 + len(name) + 1 + len(value) + 1
+    buf = _pg_calloc(1, 1 + msg_len)
+    off = _put_u8(buf, 0, 83) # 'S'
+    off = _put_i32_be(buf, off, msg_len)
+    off = _put_cstr(buf, off, name)
+    off = _put_cstr(buf, off, value)
+    _send_all(fd, buf, off)
+    _pg_free(buf)
+
+def send_ready_for_query(fd: i32, status_byte: int = 73) -> None:
+    # 73 = 'I' (idle), 84 = 'T' (in tx)
+    buf = _pg_calloc(1, 6)
+    off = _put_u8(buf, 0, 90) # 'Z'
+    off = _put_i32_be(buf, off, 5)
+    off = _put_u8(buf, off, status_byte)
+    _send_all(fd, buf, off)
+    _pg_free(buf)
+
+def send_command_complete(fd: i32, tag: str) -> None:
+    msg_len = 4 + len(tag) + 1
+    buf = _pg_calloc(1, 1 + msg_len)
+    off = _put_u8(buf, 0, 67) # 'C'
+    off = _put_i32_be(buf, off, msg_len)
+    off = _put_cstr(buf, off, tag)
+    _send_all(fd, buf, off)
+    _pg_free(buf)
+
+def send_error_response(fd: i32, msg: str) -> None:
+    # 'E' len 'S' "ERROR\0" 'M' msg "\0" '\0'
+    msg_len = 4 + 1 + 6 + 1 + len(msg) + 1 + 1
+    buf = _pg_calloc(1, 1 + msg_len)
+    off = _put_u8(buf, 0, 69) # 'E'
+    off = _put_i32_be(buf, off, msg_len)
+    off = _put_u8(buf, off, 83) # 'S'
+    off = _put_cstr(buf, off, "ERROR")
+    off = _put_u8(buf, off, 77) # 'M'
+    off = _put_cstr(buf, off, msg)
+    off = _put_u8(buf, off, 0)
+    _send_all(fd, buf, off)
+    _pg_free(buf)
+
+def send_simple_tag(fd: i32, tag_byte: int) -> None:
+    buf = _pg_calloc(1, 5)
+    off = _put_u8(buf, 0, tag_byte)
+    off = _put_i32_be(buf, off, 4)
+    _send_all(fd, buf, off)
+    _pg_free(buf)
+
+def send_backend_key_data(fd: i32, pid: int, secret: int) -> None:
+    buf = _pg_calloc(1, 13)
+    off = _put_u8(buf, 0, 75) # 'K'
+    off = _put_i32_be(buf, off, 12)
+    off = _put_i32_be(buf, off, pid)
+    off = _put_i32_be(buf, off, secret)
+    _send_all(fd, buf, off)
+    _pg_free(buf)
+
+def send_param_description(fd: i32, nparams: int) -> None:
+    total = 4 + 2 + nparams * 4
+    buf = _pg_calloc(1, 1 + total)
+    off = _put_u8(buf, 0, 116) # 't'
+    off = _put_i32_be(buf, off, total)
+    off = _put_i16_be(buf, off, nparams)
+    i = 0
+    while i < nparams:
+        off = _put_i32_be(buf, off, 25) # TEXT oid
+        i += 1
+    _send_all(fd, buf, off)
+    _pg_free(buf)
+
+def _count_query_params(query: str) -> int:
+    max_p = 0
+    i = 0
+    n = len(query)
+    b = query.bin
+    while i < n:
+        if int(val(b + i)) == 36: # '$'
+            j = i + 1
+            num = 0
+            has_d = False
+            while j < n:
+                ch = int(val(b + j))
+                if ch >= 48 and ch <= 57:
+                    num = num * 10 + (ch - 48)
+                    has_d = True
+                    j += 1
+                else:
+                    break
+            if has_d and num > max_p:
+                max_p = num
+            i = j
+        else:
+            i += 1
+    return max_p
+
+def _find_stmt(names: list[str], name: str) -> int:
+    i = 0
+    while i < len(names):
+        if names[i] == name:
+            return i
+        i += 1
+    return -1
+
+def send_row_description(fd: i32, cols: list[str]) -> None:
+    total = 4 + 2
+    i = 0
+    while i < len(cols):
+        total += len(cols[i]) + 1 + 18
+        i += 1
+    buf = _pg_calloc(1, 1 + total)
+    off = _put_u8(buf, 0, 84) # 'T'
+    off = _put_i32_be(buf, off, total)
+    off = _put_i16_be(buf, off, len(cols))
+    i = 0
+    while i < len(cols):
+        off = _put_cstr(buf, off, cols[i])
+        off = _put_i32_be(buf, off, 0)   # table oid
+        off = _put_i16_be(buf, off, 0)   # attr num
+        off = _put_i32_be(buf, off, 25)  # TEXT oid = 25
+        off = _put_i16_be(buf, off, -1)  # typlen
+        off = _put_i32_be(buf, off, -1)  # typmod
+        off = _put_i16_be(buf, off, 0)   # text format
+        i += 1
+    _send_all(fd, buf, off)
+    _pg_free(buf)
+
+def send_data_row(fd: i32, row: list[str]) -> None:
+    total = 4 + 2
+    i = 0
+    while i < len(row):
+        if row[i] == "NULL":
+            total += 4
+        else:
+            total += 4 + len(row[i])
+        i += 1
+    buf = _pg_calloc(1, 1 + total)
+    off = _put_u8(buf, 0, 68) # 'D'
+    off = _put_i32_be(buf, off, total)
+    off = _put_i16_be(buf, off, len(row))
+    i = 0
+    while i < len(row):
+        if row[i] == "NULL":
+            off = _put_i32_be(buf, off, -1)
+        else:
+            off = _put_i32_be(buf, off, len(row[i]))
+            off = _put_str_raw(buf, off, row[i])
+        i += 1
+    _send_all(fd, buf, off)
+    _pg_free(buf)
+
+def send_rows_and_complete(fd: i32, rows: list[list[str]], tag: str) -> None:
+    total = 1 + 4 + len(tag) + 1
+    ri = 0
+    while ri < len(rows):
+        row = rows[ri]
+        rtot = 4 + 2
+        ci = 0
+        while ci < len(row):
+            if row[ci] == "NULL":
+                rtot += 4
+            else:
+                rtot += 4 + len(row[ci])
+            ci += 1
+        total += 1 + rtot
+        ri += 1
+
+    buf = _pg_calloc(1, total)
+    off = 0
+    ri = 0
+    while ri < len(rows):
+        row = rows[ri]
+        rtot = 4 + 2
+        ci = 0
+        while ci < len(row):
+            if row[ci] == "NULL":
+                rtot += 4
+            else:
+                rtot += 4 + len(row[ci])
+            ci += 1
+        off = _put_u8(buf, off, 68) # 'D'
+        off = _put_i32_be(buf, off, rtot)
+        off = _put_i16_be(buf, off, len(row))
+        ci = 0
+        while ci < len(row):
+            if row[ci] == "NULL":
+                off = _put_i32_be(buf, off, -1)
+            else:
+                off = _put_i32_be(buf, off, len(row[ci]))
+                off = _put_str_raw(buf, off, row[ci])
+            ci += 1
+        ri += 1
+
+    tag_len = 4 + len(tag) + 1
+    off = _put_u8(buf, off, 67) # 'C'
+    off = _put_i32_be(buf, off, tag_len)
+    off = _put_cstr(buf, off, tag)
+    _send_all(fd, buf, off)
+    _pg_free(buf)
+
+def handle_client(fd: i32) -> None:
+    hdr = _pg_calloc(1, 8)
+    dbname = "postgres"
+    # Startup handshake (may start with SSLRequest)
+    while True:
+        if not _recv_exact(fd, hdr, 8):
+            _pg_free(hdr)
+            return
+        mlen = _get_i32_be(hdr, 0)
+        code = _get_i32_be(hdr, 4)
+        if code == 80877103: # SSLRequest
+            n_byte = _pg_calloc(1, 1)
+            val(n_byte) = u8(78) # 'N'
+            _send_all(fd, n_byte, 1)
+            _pg_free(n_byte)
+            continue
+        # Parse remaining startup payload for database name
+        rem = mlen - 8
+        if rem > 0:
+            tmp = _pg_calloc(1, rem)
+            if _recv_exact(fd, tmp, rem):
+                dbname = _parse_startup_db(tmp, rem)
+            _pg_free(tmp)
+        break
+
+    db_idx = _resolve_db_idx(dbname)
+
+    send_auth_ok(fd)
+    send_param_status(fd, "server_version", "16.0")
+    send_param_status(fd, "client_encoding", "UTF8")
+    send_param_status(fd, "server_encoding", "UTF8")
+    send_param_status(fd, "standard_conforming_strings", "on")
+    send_param_status(fd, "integer_datetimes", "on")
+    send_param_status(fd, "DateStyle", "ISO, MDY")
+    send_param_status(fd, "TimeZone", "UTC")
+    send_backend_key_data(fd, 1, 12345)
+    send_ready_for_query(fd, 73)
+
+    stmt_names: list[str] = []
+    stmt_queries: list[str] = []
+    portal_query = ""
+    portal_params: list[str] = []
+    portal_has_res = False
+    portal_res_cols: list[str] = []
+    portal_res_rows: list[list[str]] = []
+    portal_res_tag = ""
+
+    out = _OutBuf()
+    # Message loop
+    tok_cache: dict[str, list[sql.Token]] = {}
+    mhdr = _pg_calloc(1, 5)
+    while True:
+        if not _recv_exact(fd, mhdr, 5):
+            break
+        mtype = int(val(mhdr))
+        mlen = _get_i32_be(mhdr, 1)
+        body_len = mlen - 4
+        if mtype == 88: # 'X' Terminate
+            break
+        body = _pg_calloc(1, body_len + 1)
+        if body_len > 0:
+            if not _recv_exact(fd, body, body_len):
+                _pg_free(body)
+                break
+        if mtype == 81: # 'Q' Simple Query
+            query = unbin(body)
+            if _is_read_only_query(query) and not _db_list[db_idx].in_tx:
+                tokens: list[sql.Token] = []
+                if query in tok_cache:
+                    tokens = tok_cache[query].copy()
+                else:
+                    tokens = sql.tokenize(query)
+                    if len(tok_cache) < 128:
+                        tok_cache[query.copy()] = tokens.copy()
+                _rdlock_db(db_idx)
+                try:
+                    res = _db_list[db_idx].execute_tokens(tokens)
+                    _unlock_db(db_idx)
+                    if len(res.columns) > 0:
+                        out.write_row_description(res.columns)
+                    out.write_rows_and_complete(res.rows, res.command_tag)
+                except Exception as err:
+                    _unlock_db(db_idx)
+                    out.write_error(str(err))
+            else:
+                parsed = engine.parse_literal_insert(query)
+                _wrlock_db(db_idx)
+                try:
+                    if parsed.ok:
+                        fast_res = _db_list[db_idx].exec_parsed_insert(parsed)
+                        if fast_res is not None:
+                            res = fast_res
+                        else:
+                            res = _db_list[db_idx].execute(query)
+                    else:
+                        res = _db_list[db_idx].execute(query)
+                    _unlock_db(db_idx)
+                    if len(res.columns) > 0:
+                        out.write_row_description(res.columns)
+                    out.write_rows_and_complete(res.rows, res.command_tag)
+                except Exception as err:
+                    _unlock_db(db_idx)
+                    out.write_error(str(err))
+            st = 84 if _db_list[db_idx].in_tx else 73
+            out.write_ready_for_query(st)
+            out.flush(fd)
+        elif mtype == 80: # 'P' Parse
+            off = 0
+            slen = _read_cstr_len(body, off, body_len)
+            sname = _read_bytes_str(body, off, slen)
+            off = off + slen + 1
+            qlen = _read_cstr_len(body, off, body_len)
+            qstr = _read_bytes_str(body, off, qlen)
+            idx = _find_stmt(stmt_names, sname)
+            if idx >= 0:
+                stmt_queries[idx] = qstr
+            else:
+                stmt_names.append(sname)
+                stmt_queries.append(qstr)
+            out.write_simple_tag(49) # '1' ParseComplete
+        elif mtype == 66: # 'B' Bind
+            off = 0
+            plen = _read_cstr_len(body, off, body_len)
+            off = off + plen + 1
+            slen = _read_cstr_len(body, off, body_len)
+            sname = _read_bytes_str(body, off, slen)
+            off = off + slen + 1
+            nfmt = _get_i16_be(body, off)
+            off = off + 2 + nfmt * 2
+            nparams = _get_i16_be(body, off)
+            off = off + 2
+            portal_params = []
+            pi = 0
+            while pi < nparams:
+                vlen = _get_i32_be(body, off)
+                off = off + 4
+                if vlen < 0:
+                    portal_params.append("NULL")
+                else:
+                    portal_params.append(_read_bytes_str(body, off, vlen))
+                    off = off + vlen
+                pi += 1
+            idx = _find_stmt(stmt_names, sname)
+            portal_query = stmt_queries[idx].copy() if idx >= 0 else ""
+            portal_has_res = False
+            out.write_simple_tag(50) # '2' BindComplete
+        elif mtype == 68: # 'D' Describe
+            dkind = int(val(body))
+            dlen = _read_cstr_len(body, 1, body_len)
+            dname = _read_bytes_str(body, 1, dlen)
+            if dkind == 83: # 'S' Statement
+                idx = _find_stmt(stmt_names, dname)
+                qstr = stmt_queries[idx].copy() if idx >= 0 else ""
+                np = _count_query_params(qstr)
+                out.write_param_description(np)
+                _rdlock_db(db_idx)
+                try:
+                    dcols = _db_list[db_idx].describe_columns(qstr)
+                    _unlock_db(db_idx)
+                    if len(dcols) > 0:
+                        out.write_row_description(dcols)
+                    else:
+                        out.write_simple_tag(110) # 'n' NoData
+                except Exception as err:
+                    _unlock_db(db_idx)
+                    out.write_simple_tag(110)
+            else: # 'P' Portal
+                if _is_read_only_query(portal_query) and not _db_list[db_idx].in_tx:
+                    _rdlock_db(db_idx)
+                else:
+                    _wrlock_db(db_idx)
+                try:
+                    res = _db_list[db_idx].execute(portal_query, portal_params.copy())
+                    _unlock_db(db_idx)
+                    portal_res_cols = res.columns
+                    portal_res_rows = res.rows
+                    portal_res_tag = res.command_tag
+                    portal_has_res = True
+                    if len(portal_res_cols) > 0:
+                        out.write_row_description(portal_res_cols)
+                    else:
+                        out.write_simple_tag(110) # 'n' NoData
+                except Exception as err:
+                    _unlock_db(db_idx)
+                    out.write_error(str(err))
+        elif mtype == 69: # 'E' Execute
+            if not portal_has_res:
+                if _is_read_only_query(portal_query) and not _db_list[db_idx].in_tx:
+                    _rdlock_db(db_idx)
+                else:
+                    _wrlock_db(db_idx)
+                try:
+                    res = _db_list[db_idx].execute(portal_query, portal_params.copy())
+                    _unlock_db(db_idx)
+                    portal_res_cols = res.columns
+                    portal_res_rows = res.rows
+                    portal_res_tag = res.command_tag
+                    out.write_rows_and_complete(portal_res_rows, portal_res_tag)
+                except Exception as err:
+                    _unlock_db(db_idx)
+                    out.write_error(str(err))
+            else:
+                out.write_rows_and_complete(portal_res_rows, portal_res_tag)
+                portal_has_res = False
+        elif mtype == 67: # 'C' Close
+            out.write_simple_tag(51) # '3' CloseComplete
+        elif mtype == 72: # 'H' Flush
+            out.flush(fd)
+        elif mtype == 83: # 'S' Sync
+            st = 84 if _db_list[db_idx].in_tx else 73
+            out.write_ready_for_query(st)
+            out.flush(fd)
+        _pg_free(body)
+
+    out.destroy()
+    _pg_free(mhdr)
+    _pg_free(hdr)
+
+@extern("unlink")
+def _pg_unlink(path: addr[u8]) -> i32:
+    pass
+
+def _client_thread(arg: addr[u8]) -> addr[u8] | None:
+    cfd = i32(_get_i32_be(arg, 0))
+    _pg_free(arg)
+    try:
+        handle_client(cfd)
+    except Exception as err:
+        pass
+    _pg_close(cfd)
+    return None
+
+def _spawn_client(cfd: i32) -> None:
+    arg = _pg_calloc(1, 8)
+    _put_i32_be(arg, 0, int(cfd))
+    tid: u64 = u64(0)
+    rc = _pg_pthread_create(tid.addr, None, _client_thread, arg)
+    if rc == i32(0):
+        _pg_pthread_detach(tid)
+    else:
+        _pg_free(arg)
+        _pg_close(cfd)
+
+def _init_shared_db(db_path: str, is_dir: bool) -> None:
+    global _db_dir
+    global _db_map_lock
+    _db_map_lock = threading.RWLock()
+    if is_dir:
+        _db_dir = db_path.copy()
+    else:
+        _db_dir = ""
+        db = engine.open_db(db_path.copy())
+        db.store.server_mode = True
+        _db_names.append("default")
+        _db_list.append(db)
+        _rw_list.append(threading.RWLock())
+
+def serve_unix(db_path: str, sock_path: str, is_dir: bool = False) -> None:
+    _pg_unlink(sock_path.bin)
+    sfd = _pg_socket(i32(1), i32(1), i32(0)) # AF_UNIX=1, SOCK_STREAM=1
+    if sfd < i32(0):
+        raise "RuntimeError: unix socket() failed"
+    sa = _pg_calloc(1, 106)
+    if sys.platform == "darwin":
+        val(sa + 0) = u8(106)
+        val(sa + 1) = u8(1) # AF_UNIX
+    else:
+        val(sa + 0) = u8(1)
+        val(sa + 1) = u8(0)
+    _put_cstr(sa, 2, sock_path)
+    rc = _pg_bind(sfd, sa, i32(106))
+    _pg_free(sa)
+    if rc != i32(0):
+        _pg_close(sfd)
+        raise f"RuntimeError: bind({sock_path}) failed"
+    if _pg_listen(sfd, i32(128)) != i32(0):
+        _pg_close(sfd)
+        raise "RuntimeError: listen() failed"
+    _init_shared_db(db_path, is_dir)
+    if is_dir:
+        print(f"StrictQL listening on unix:{sock_path} (dir={db_path})")
+    else:
+        print(f"StrictQL listening on unix:{sock_path} (db={db_path})")
+    while True:
+        cfd = _pg_accept(sfd, None, None)
+        if cfd < i32(0):
+            continue
+        _spawn_client(cfd)
+
+def serve(db_path: str, port: int = 5432, is_dir: bool = False) -> None:
+    sfd = _pg_socket(i32(2), i32(1), i32(0)) # AF_INET=2, SOCK_STREAM=1
+    if sfd < i32(0):
+        raise "RuntimeError: socket() failed"
+    one: i32 = i32(1)
+    sol_socket = i32(65535) if sys.platform == "darwin" else i32(1)
+    so_reuseaddr = i32(4) if sys.platform == "darwin" else i32(2)
+    _pg_setsockopt(sfd, sol_socket, so_reuseaddr, one.addr, i32(4))
+
+    # Build struct sockaddr_in (16 bytes)
+    sa = _pg_calloc(1, 16)
+    if sys.platform == "darwin":
+        val(sa + 0) = u8(16) # sin_len
+        val(sa + 1) = u8(2)  # AF_INET
+    else:
+        val(sa + 0) = u8(2)  # AF_INET
+        val(sa + 1) = u8(0)
+    val(sa + 2) = u8((port >> 8) & 255)
+    val(sa + 3) = u8(port & 255)
+    # 127.0.0.1
+    val(sa + 4) = u8(127)
+    val(sa + 5) = u8(0)
+    val(sa + 6) = u8(0)
+    val(sa + 7) = u8(1)
+
+    if _pg_bind(sfd, sa, i32(16)) != i32(0):
+        _pg_free(sa)
+        _pg_close(sfd)
+        raise "RuntimeError: bind() failed"
+    _pg_free(sa)
+
+    if _pg_listen(sfd, i32(128)) != i32(0):
+        _pg_close(sfd)
+        raise "RuntimeError: listen() failed"
+
+    _init_shared_db(db_path, is_dir)
+    if is_dir:
+        print(f"StrictQL listening on 127.0.0.1:{port} (dir={db_path})")
+    else:
+        print(f"StrictQL listening on 127.0.0.1:{port} (db={db_path})")
+    while True:
+        cfd = _pg_accept(sfd, None, None)
+        if cfd < i32(0):
+            continue
+        _spawn_client(cfd)

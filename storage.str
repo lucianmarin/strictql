@@ -1,0 +1,542 @@
+import multiprocessing
+import os
+
+@extern("fopen")
+def _st_fopen(path: addr[u8], mode: addr[u8]) -> addr[u8] | None:
+    pass
+
+@extern("fwrite")
+def _st_fwrite(buf: addr[u8], size: int, count: int, fp: addr[u8]) -> int:
+    pass
+
+@extern("fflush")
+def _st_fflush(fp: addr[u8]) -> i32:
+    pass
+
+@extern("fclose")
+def _st_fclose(fp: addr[u8]) -> i32:
+    pass
+
+def _escape_field(s: str) -> str:
+    b = s.bin
+    n = len(s)
+    needs = False
+    i = 0
+    while i < n:
+        c = int(val(b + i))
+        if c == 92 or c == 9 or c == 10 or c == 13:
+            needs = True
+            break
+        i += 1
+    if not needs:
+        return s.copy()
+    out = ""
+    i = 0
+    while i < n:
+        ch = s[i]
+        if ch == "\\":
+            out += "\\\\"
+        elif ch == "\t":
+            out += "\\t"
+        elif ch == "\n":
+            out += "\\n"
+        elif ch == "\r":
+            out += "\\r"
+        else:
+            out += ch
+        i += 1
+    return out
+
+def _unescape_field(s: str) -> str:
+    out = ""
+    i = 0
+    n = len(s)
+    while i < n:
+        ch = s[i]
+        if ch == "\\" and i + 1 < n:
+            nxt = s[i + 1]
+            if nxt == "t":
+                out += "\t"
+            elif nxt == "n":
+                out += "\n"
+            elif nxt == "r":
+                out += "\r"
+            else:
+                out += nxt
+            i += 2
+        else:
+            out += ch
+            i += 1
+    return out
+
+def _split_tabs(line: str) -> list[str]:
+    parts: list[str] = []
+    cur = ""
+    i = 0
+    n = len(line)
+    while i < n:
+        ch = line[i]
+        if ch == "\t":
+            parts.append(cur)
+            cur = ""
+        else:
+            cur = cur + ch
+        i += 1
+    parts.append(cur)
+    return parts
+
+class ColumnDef:
+    name: str
+    col_type: str
+    is_pk: bool
+    is_serial: bool
+    not_null: bool
+    default_val: str
+    has_default: bool
+
+    def __init__(self, name: str, col_type: str, is_pk: bool = False, is_serial: bool = False, not_null: bool = False, default_val: str = "", has_default: bool = False) -> None:
+        self.name = name
+        self.col_type = col_type
+        self.is_pk = is_pk
+        self.is_serial = is_serial
+        self.not_null = not_null
+        self.default_val = default_val
+        self.has_default = has_default
+
+def encode_cell(col_type: str, raw: str, is_null: bool) -> int | float | str | bool | None:
+    if is_null:
+        return None
+    ct = col_type.upper()
+    if ct == "INTEGER" or ct == "INT" or ct == "BIGINT" or ct == "SMALLINT" or ct == "SERIAL" or ct == "BIGSERIAL":
+        if len(raw) > 0:
+            return int(raw)
+        return 0
+    if ct == "REAL" or ct == "FLOAT" or ct == "DOUBLE" or ct == "DOUBLE PRECISION" or ct == "NUMERIC":
+        if len(raw) > 0:
+            return float(raw)
+        return 0.0
+    if ct == "BOOLEAN" or ct == "BOOL":
+        rl = raw.lower()
+        return rl == "true" or rl == "t" or rl == "1"
+    return raw.copy()
+
+def encode_row(cols: list[ColumnDef], vals: list[str], nulls: list[bool]) -> list[int | float | str | bool | None]:
+    cells: list[int | float | str | bool | None] = []
+    i = 0
+    while i < len(vals):
+        ct = cols[i].col_type.copy() if i < len(cols) else "TEXT"
+        cells.append(encode_cell(ct, vals[i], nulls[i]))
+        i += 1
+    return cells
+
+def clone_cell(c: int | float | str | bool | None) -> int | float | str | bool | None:
+    if c is None:
+        return None
+    if isinstance(c, str):
+        return c.copy()
+    if isinstance(c, int):
+        return c
+    if isinstance(c, float):
+        return c
+    if isinstance(c, bool):
+        return c
+    return None
+
+def cell_to_str(c: int | float | str | bool | None) -> str:
+    if c is None:
+        return ""
+    if isinstance(c, bool):
+        return "t" if c else "f"
+    return str(c)
+
+class Row:
+    row_id: i64
+    xmin: i64
+    xmax: i64
+    cells: list[int | float | str | bool | None]
+
+    def __init__(self, row_id: i64, xmin: i64, xmax: i64, cells: list[int | float | str | bool | None]) -> None:
+        self.row_id = row_id
+        self.xmin = xmin
+        self.xmax = xmax
+        self.cells = cells
+
+    def is_null(self, idx: int) -> bool:
+        return self.cells[idx] is None
+
+    def get_str(self, idx: int) -> str:
+        return cell_to_str(self.cells[idx])
+
+    def get_float(self, idx: int) -> float:
+        c = self.cells[idx]
+        if isinstance(c, float):
+            return c
+        if isinstance(c, int):
+            return float(c)
+        if isinstance(c, str):
+            return float(c)
+        return 0.0
+
+    def get_int(self, idx: int) -> int:
+        c = self.cells[idx]
+        if isinstance(c, int):
+            return c
+        if isinstance(c, float):
+            return int(c)
+        if isinstance(c, str):
+            return int(c)
+        return 0
+
+    def is_visible(self, snapshot_txid: i64) -> bool:
+        if self.xmin > snapshot_txid:
+            return False
+        if self.xmax != 0 and self.xmax <= snapshot_txid:
+            return False
+        return True
+
+class HashIndex:
+    col_idx: int
+    buckets: dict[str, list[int]]
+
+    def __init__(self, col_idx: int) -> None:
+        self.col_idx = col_idx
+        self.buckets = {}
+
+    def add(self, key: str, row_idx: int) -> None:
+        if key in self.buckets:
+            self.buckets[key].append(row_idx)
+        else:
+            self.buckets[key] = [row_idx]
+
+class Table:
+    name: str
+    columns: list[ColumnDef]
+    rows: list[Row]
+    indexes: list[HashIndex]
+    next_seq: i64
+
+    def __init__(self, name: str, columns: list[ColumnDef]) -> None:
+        self.name = name
+        self.columns = columns
+        self.rows = []
+        self.indexes = []
+        self.next_seq = 1
+        i = 0
+        while i < len(self.columns):
+            if self.columns[i].is_pk:
+                self.indexes.append(HashIndex(i))
+            i += 1
+
+    def col_index(self, col_name: str) -> int:
+        target = col_name.lower()
+        i = 0
+        while i < len(self.columns):
+            if self.columns[i].name.lower() == target:
+                return i
+            i += 1
+        return -1
+
+    def find_index(self, col_idx: int) -> int:
+        i = 0
+        while i < len(self.indexes):
+            if self.indexes[i].col_idx == col_idx:
+                return i
+            i += 1
+        return -1
+
+    def add_index(self, col_idx: int) -> None:
+        if col_idx < 0 or self.find_index(col_idx) >= 0:
+            return
+        idx = HashIndex(col_idx)
+        ri = 0
+        while ri < len(self.rows):
+            if not self.rows[ri].is_null(col_idx):
+                idx.add(self.rows[ri].get_str(col_idx), ri)
+            ri += 1
+        self.indexes.append(idx)
+
+    def append_row(self, row: Row) -> int:
+        ridx = len(self.rows)
+        ii = 0
+        while ii < len(self.indexes):
+            ci = self.indexes[ii].col_idx
+            if not row.is_null(ci):
+                self.indexes[ii].add(row.get_str(ci), ridx)
+            ii += 1
+        self.rows.append(row)
+        return ridx
+
+class Storage:
+    path: str
+    wal_path: str
+    shm_path: str
+    lock_path: str
+    shm: multiprocessing.SharedMemory
+    flock: multiprocessing.FileLock
+    tables: list[Table]
+    last_loaded_txid: i64
+    wal_fp: addr[u8] | None
+    closed: bool
+    server_mode: bool
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+        self.wal_path = self.path + ".wal"
+        self.shm_path = self.path + ".shm"
+        self.lock_path = self.path + ".lock"
+        self.tables = []
+        self.last_loaded_txid = 0
+        self.wal_fp = None
+        self.closed = False
+        self.server_mode = False
+        self.flock = multiprocessing.FileLock(self.lock_path)
+        self.shm = multiprocessing.SharedMemory(64, self.shm_path)
+
+        # Initialize atomic txid counter if fresh (slot 0 = next_txid, slot 1 = wal_version)
+        p = self.shm.ptr_i64()
+        if atomic_load(p) == 0:
+            atomic_cas(p, 0, 1)
+
+        self.reload()
+
+    def next_txid(self) -> i64:
+        return atomic_add(self.shm.ptr_i64(), 1)
+
+    def current_txid(self) -> i64:
+        return atomic_load(self.shm.ptr_i64())
+
+    def find_table(self, name: str) -> int:
+        target = name.lower()
+        i = 0
+        while i < len(self.tables):
+            if self.tables[i].name.lower() == target:
+                return i
+            i += 1
+        return -1
+
+    def _apply_record(self, line: str) -> None:
+        if len(line) == 0 or line == "STRQL001":
+            return
+        parts = _split_tabs(line)
+        if len(parts) < 2:
+            return
+        op = parts[0]
+        if op == "TABLE":
+            # TABLE <name> <next_seq> <col_count> (<col_name> <col_type> <pk> <serial> <notnull>)...
+            tname = _unescape_field(parts[1])
+            nseq = int(parts[2])
+            ccount = int(parts[3])
+            cols: list[ColumnDef] = []
+            idx = 4
+            c = 0
+            while c < ccount and idx + 4 < len(parts):
+                cn = _unescape_field(parts[idx])
+                ct = _unescape_field(parts[idx + 1])
+                pk = parts[idx + 2] == "1"
+                ser = parts[idx + 3] == "1"
+                nn = parts[idx + 4] == "1"
+                cols.append(ColumnDef(cn, ct, pk, ser, nn))
+                idx += 5
+                c += 1
+            ti = self.find_table(tname)
+            if ti < 0:
+                t = Table(tname, cols)
+                t.next_seq = nseq
+                self.tables.append(t)
+            else:
+                self.tables[ti].next_seq = nseq
+        elif op == "DROP":
+            tname = _unescape_field(parts[1])
+            ti = self.find_table(tname)
+            if ti >= 0:
+                self.tables.pop(ti)
+        elif op == "INS":
+            # INS <table> <row_id> <xmin> <xmax> <col_count> (<is_null> <val>)...
+            tname = _unescape_field(parts[1])
+            ti = self.find_table(tname)
+            if ti < 0:
+                return
+            rid = int(parts[2])
+            xmin = int(parts[3])
+            xmax = int(parts[4])
+            ccount = int(parts[5])
+            cells: list[int | float | str | bool | None] = []
+            idx = 6
+            c = 0
+            while c < ccount and idx + 1 < len(parts):
+                is_n = parts[idx] == "1"
+                v = _unescape_field(parts[idx + 1])
+                ctype = self.tables[ti].columns[c].col_type.copy() if c < len(self.tables[ti].columns) else "TEXT"
+                cells.append(encode_cell(ctype, v, is_n))
+                idx += 2
+                c += 1
+            self.tables[ti].append_row(Row(rid, xmin, xmax, cells))
+            if rid >= self.tables[ti].next_seq:
+                self.tables[ti].next_seq = rid + 1
+        elif op == "IDX":
+            # IDX <table> <col_name>
+            tname = _unescape_field(parts[1])
+            cname = _unescape_field(parts[2])
+            ti = self.find_table(tname)
+            if ti >= 0:
+                ci = self.tables[ti].col_index(cname)
+                if ci >= 0:
+                    self.tables[ti].add_index(ci)
+        elif op == "DEL":
+            # DEL <table> <row_id> <xmax>
+            tname = _unescape_field(parts[1])
+            ti = self.find_table(tname)
+            if ti < 0:
+                return
+            rid = int(parts[2])
+            xmax = int(parts[3])
+            r = 0
+            while r < len(self.tables[ti].rows):
+                if self.tables[ti].rows[r].row_id == rid and self.tables[ti].rows[r].xmax == 0:
+                    self.tables[ti].rows[r].xmax = xmax
+                    break
+                r += 1
+
+    def _load_file(self, fpath: str) -> None:
+        if not os.exists(fpath):
+            return
+        with open(fpath, "r") as f:
+            content = f.read()
+        lines = content.split("\n")
+        i = 0
+        while i < len(lines):
+            self._apply_record(lines[i])
+            i += 1
+
+    def reload(self) -> None:
+        if self.server_mode:
+            return
+        cur = self.current_txid()
+        if self.last_loaded_txid > 0 and self.last_loaded_txid == cur:
+            return
+        self.flock.lock_shared()
+        self.tables = []
+        self._load_file(self.path)
+        self._load_file(self.wal_path)
+        self.last_loaded_txid = self.current_txid()
+        self.flock.unlock()
+
+    def _serialize_table_def(self, t: Table) -> str:
+        line = "TABLE\t" + _escape_field(t.name) + "\t" + str(t.next_seq) + "\t" + str(len(t.columns))
+        i = 0
+        while i < len(t.columns):
+            c = t.columns[i]
+            line = line + "\t" + _escape_field(c.name) + "\t" + _escape_field(c.col_type)
+            line = line + "\t" + ("1" if c.is_pk else "0")
+            line = line + "\t" + ("1" if c.is_serial else "0")
+            line = line + "\t" + ("1" if c.not_null else "0")
+            i += 1
+        return line
+
+    def _serialize_row(self, tname: str, row: Row) -> str:
+        line = "INS\t" + _escape_field(tname) + "\t" + str(row.row_id) + "\t" + str(row.xmin) + "\t" + str(row.xmax) + "\t" + str(len(row.cells))
+        i = 0
+        while i < len(row.cells):
+            if row.is_null(i):
+                line += "\t1\t"
+            else:
+                line += "\t0\t" + _escape_field(row.get_str(i))
+            i += 1
+        return line
+
+    def append_wal(self, records: list[str]) -> None:
+        if len(records) == 0:
+            return
+        if self.server_mode:
+            payload = "\n".join(records) + "\n"
+            fp = self.wal_fp
+            if fp is None:
+                fp = _st_fopen(self.wal_path.bin, "a".bin)
+                self.wal_fp = fp
+            if fp is not None:
+                _st_fwrite(payload.bin, 1, len(payload), fp)
+            return
+        self.flock.lock_exclusive()
+        payload = "\n".join(records) + "\n"
+        fp = self.wal_fp
+        if fp is not None and not os.exists(self.wal_path):
+            _st_fclose(fp)
+            self.wal_fp = None
+        fp2 = self.wal_fp
+        if fp2 is None:
+            fp2 = _st_fopen(self.wal_path.bin, "a".bin)
+            self.wal_fp = fp2
+        if fp2 is not None:
+            _st_fwrite(payload.bin, 1, len(payload), fp2)
+            _st_fflush(fp2)
+        cur = self.current_txid()
+        if cur == self.last_loaded_txid + 1:
+            self.last_loaded_txid = cur
+        else:
+            self.last_loaded_txid = 0
+        self.flock.unlock()
+
+    def flush_schema(self) -> None:
+        self.flock.lock_exclusive()
+        fp = self.wal_fp
+        if fp is not None:
+            _st_fclose(fp)
+            self.wal_fp = None
+        out = "STRQL001\n"
+        ti = 0
+        while ti < len(self.tables):
+            t = self.tables[ti]
+            out = out + self._serialize_table_def(t) + "\n"
+            ri = 0
+            while ri < len(t.rows):
+                if t.rows[ri].xmax == 0:
+                    out = out + self._serialize_row(t.name, t.rows[ri]) + "\n"
+                ri += 1
+            ii = 0
+            while ii < len(t.indexes):
+                ci = t.indexes[ii].col_idx
+                if ci >= 0 and ci < len(t.columns) and not t.columns[ci].is_pk:
+                    out = out + "IDX\t" + _escape_field(t.name) + "\t" + _escape_field(t.columns[ci].name) + "\n"
+                ii += 1
+            ti += 1
+        with open(self.path, "w") as f:
+            f.write(out)
+        if os.exists(self.wal_path):
+            os.remove(self.wal_path)
+        self.last_loaded_txid = self.next_txid()
+        self.flock.unlock()
+
+    def checkpoint(self) -> None:
+        self.flock.lock_exclusive()
+        fp = self.wal_fp
+        if fp is not None:
+            _st_fclose(fp)
+            self.wal_fp = None
+        # Reload latest state before compacting
+        self.tables = []
+        self._load_file(self.path)
+        self._load_file(self.wal_path)
+
+        out = "STRQL001\n"
+        ti = 0
+        while ti < len(self.tables):
+            t = self.tables[ti]
+            out = out + self._serialize_table_def(t) + "\n"
+            ri = 0
+            while ri < len(t.rows):
+                if t.rows[ri].xmax == 0:
+                    out = out + self._serialize_row(t.name, t.rows[ri]) + "\n"
+                ri += 1
+            ti += 1
+        with open(self.path, "w") as f:
+            f.write(out)
+        if os.exists(self.wal_path):
+            os.remove(self.wal_path)
+        self.flock.unlock()
+
+    def close(self) -> None:
+        if not self.closed:
+            self.checkpoint()
+            self.shm.close()
+            self.flock.close()
+            self.closed = True
