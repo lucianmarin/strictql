@@ -688,6 +688,7 @@ class Database:
     def _exec_alter_table(self, p: _Parser) -> QueryResult:
         if p.match_kw("IF"):
             p.match_kw("EXISTS")
+        p.match_kw("ONLY")
         tname = p.expect_ident()
         if p.match_op("."):
             tname = p.expect_ident()
@@ -817,9 +818,22 @@ class Database:
                         if cidx >= 0:
                             self.store.tables[ti].columns[cidx].not_null = True
                     elif p.match_kw("DEFAULT"):
-                        lit = p.parse_literal()
-                        if cidx >= 0 and not lit.is_null:
-                            self.store.tables[ti].columns[cidx].default_val = lit.value.copy()
+                        if p.peek_kind() == "IDENT" and p.peek_upper() == "NEXTVAL":
+                            if cidx >= 0:
+                                self.store.tables[ti].columns[cidx].is_serial = True
+                            p.step()
+                            if p.match_op("("):
+                                depth = 1
+                                while p.peek_kind() != "EOF" and depth > 0:
+                                    if p.peek_kind() == "OP" and p.peek_val() == "(":
+                                        depth += 1
+                                    elif p.peek_kind() == "OP" and p.peek_val() == ")":
+                                        depth -= 1
+                                    p.step()
+                        else:
+                            lit = p.parse_literal()
+                            if cidx >= 0 and not lit.is_null:
+                                self.store.tables[ti].columns[cidx].default_val = lit.value.copy()
                 elif p.match_kw("DROP"):
                     if p.match_kw("NOT"):
                         p.match_kw("NULL")
@@ -949,9 +963,18 @@ class Database:
 
     def _exec_select(self, p: _Parser) -> QueryResult:
         self.in_tx = self.in_tx
-        # Handle PostgreSQL/Django probe queries: SELECT version(), SELECT 1, etc.
+        # Handle PostgreSQL/Django probe queries: SELECT version(), SELECT 1, SELECT pg_catalog.set_config/setval, etc.
         if p.peek_kind() == "IDENT" and p.peek_upper() == "VERSION":
             return QueryResult(["version"], [["PostgreSQL 16.0 (StrictQL 0.1)"]], "SELECT 1", 1)
+        if p.peek_kind() == "IDENT" and p.peek_upper() == "PG_CATALOG":
+            p.step()
+            if p.match_op("."):
+                fn = p.expect_ident().lower()
+                if fn == "set_config":
+                    return QueryResult(["set_config"], [[""]], "SELECT 1", 1)
+                if fn == "setval":
+                    return QueryResult(["setval"], [["1"]], "SELECT 1", 1)
+            return QueryResult(["?column?"], [[""]], "SELECT 1", 1)
         if p.peek_kind() == "NUMBER":
             v = p.peek_val()
             p.step()
@@ -1977,7 +2000,8 @@ class Database:
             return None
         tname = rest[0:lp].strip().replace("\"", "")
         if "." in tname:
-            tname = tname.split(".")[-1]
+            tparts = tname.split(".")
+            tname = tparts[len(tparts) - 1].copy()
         ti = self.store.find_table(tname)
         if ti < 0:
             return None
@@ -2052,6 +2076,8 @@ class Database:
         if p.match_kw("CREATE"):
             if p.match_kw("TABLE"):
                 return self._exec_create_table(p)
+            if p.match_kw("SEQUENCE"):
+                return QueryResult([], [], "CREATE SEQUENCE", 0)
             p.match_kw("UNIQUE")
             if p.match_kw("INDEX"):
                 if p.match_kw("IF"):
@@ -2064,6 +2090,8 @@ class Database:
                     tname = p.expect_ident()
                     if p.match_op("."):
                         tname = p.expect_ident()
+                    if p.match_kw("USING"):
+                        p.step()
                     if p.match_op("("):
                         cname = p.expect_ident()
                         if not self.in_tx:
@@ -2081,10 +2109,14 @@ class Database:
                 return self._exec_drop_table(p)
             if p.match_kw("INDEX"):
                 return self._exec_drop_index(p)
+            if p.match_kw("SEQUENCE"):
+                return QueryResult([], [], "DROP SEQUENCE", 0)
             raise "SyntaxError: expected TABLE or INDEX after DROP"
         if p.match_kw("ALTER"):
             if p.match_kw("TABLE"):
                 return self._exec_alter_table(p)
+            if p.match_kw("SEQUENCE"):
+                return QueryResult([], [], "ALTER SEQUENCE", 0)
             raise "SyntaxError: expected TABLE after ALTER"
         if p.match_kw("INSERT"):
             # Cache simple single-row parameterized INSERT plans

@@ -482,23 +482,24 @@ class Storage:
         if fp is not None:
             _st_fclose(fp)
             self.wal_fp = None
-        out = "STRQL001\n"
+        lines: list[str] = ["STRQL001"]
         ti = 0
         while ti < len(self.tables):
             t = self.tables[ti]
-            out = out + self._serialize_table_def(t) + "\n"
+            lines.append(self._serialize_table_def(t))
             ri = 0
             while ri < len(t.rows):
                 if t.rows[ri].xmax == 0:
-                    out = out + self._serialize_row(t.name, t.rows[ri]) + "\n"
+                    lines.append(self._serialize_row(t.name, t.rows[ri]))
                 ri += 1
             ii = 0
             while ii < len(t.indexes):
                 ci = t.indexes[ii].col_idx
                 if ci >= 0 and ci < len(t.columns) and not t.columns[ci].is_pk:
-                    out = out + "IDX\t" + _escape_field(t.name) + "\t" + _escape_field(t.columns[ci].name) + "\n"
+                    lines.append("IDX\t" + _escape_field(t.name) + "\t" + _escape_field(t.columns[ci].name))
                 ii += 1
             ti += 1
+        out = "\n".join(lines) + "\n"
         with open(self.path, "w") as f:
             f.write(out)
         if os.exists(self.wal_path):
@@ -517,17 +518,24 @@ class Storage:
         self._load_file(self.path)
         self._load_file(self.wal_path)
 
-        out = "STRQL001\n"
+        lines: list[str] = ["STRQL001"]
         ti = 0
         while ti < len(self.tables):
             t = self.tables[ti]
-            out = out + self._serialize_table_def(t) + "\n"
+            lines.append(self._serialize_table_def(t))
             ri = 0
             while ri < len(t.rows):
                 if t.rows[ri].xmax == 0:
-                    out = out + self._serialize_row(t.name, t.rows[ri]) + "\n"
+                    lines.append(self._serialize_row(t.name, t.rows[ri]))
                 ri += 1
+            ii = 0
+            while ii < len(t.indexes):
+                ci = t.indexes[ii].col_idx
+                if ci >= 0 and ci < len(t.columns) and not t.columns[ci].is_pk:
+                    lines.append("IDX\t" + _escape_field(t.name) + "\t" + _escape_field(t.columns[ci].name))
+                ii += 1
             ti += 1
+        out = "\n".join(lines) + "\n"
         with open(self.path, "w") as f:
             f.write(out)
         if os.exists(self.wal_path):
