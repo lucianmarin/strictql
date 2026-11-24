@@ -122,6 +122,62 @@ def test_multiprocess_writers() -> None:
     db_check.close()
     _cleanup_db(path)
 
+def test_constraints_groupby_exists_checkpoint() -> None:
+    path = "/tmp/strictql_test_prod.strictql"
+    _cleanup_db(path)
+
+    db = engine.open_db(path.copy())
+    db.execute("CREATE TABLE members (id INT, username TEXT, score INT)")
+    db.execute("INSERT INTO members (id, username, score) VALUES (1, 'alice', 10), (2, 'bob', 20)")
+    db.execute("ALTER TABLE ONLY members ADD CONSTRAINT members_pkey PRIMARY KEY (id)")
+    db.execute("ALTER TABLE ONLY members ADD CONSTRAINT members_username_key UNIQUE (username)")
+
+    # Duplicate PK rejected; ON CONFLICT DO NOTHING skips
+    pk_err = False
+    try:
+        db.execute("INSERT INTO members (id, username, score) VALUES (1, 'charlie', 30)")
+    except Exception:
+        pk_err = True
+    assert pk_err
+    db.execute("INSERT INTO members (id, username, score) VALUES (1, 'charlie', 30) ON CONFLICT DO NOTHING")
+
+    # Duplicate UNIQUE rejected; ON CONFLICT DO NOTHING skips
+    uq_err = False
+    try:
+        db.execute("INSERT INTO members (id, username, score) VALUES (3, 'alice', 30)")
+    except Exception:
+        uq_err = True
+    assert uq_err
+    db.execute("INSERT INTO members (id, username, score) VALUES (3, 'alice', 30) ON CONFLICT DO NOTHING")
+
+    # GROUP BY MAX
+    db.execute("CREATE TABLE notes (id SERIAL PRIMARY KEY, member_id INT, body TEXT)")
+    db.execute("INSERT INTO notes (member_id, body) VALUES (1, 'a1'), (1, 'a2'), (2, 'b1')")
+    g_res = db.execute("SELECT MAX(id) AS last_id FROM notes GROUP BY member_id")
+    assert len(g_res.rows) == 2
+
+    # WHERE [NOT] EXISTS
+    db.execute("INSERT INTO members (id, username, score) VALUES (3, 'dave', 0)")
+    ex_res = db.execute("SELECT username FROM members WHERE EXISTS (SELECT 1 AS a FROM notes WHERE notes.member_id = members.id) ORDER BY id ASC")
+    assert len(ex_res.rows) == 2
+    assert ex_res.rows[0][0] == "alice"
+    nex_res = db.execute("SELECT username FROM members WHERE NOT EXISTS (SELECT 1 AS a FROM notes WHERE notes.member_id = members.id)")
+    assert len(nex_res.rows) == 1
+    assert nex_res.rows[0][0] == "dave"
+
+    # CHECKPOINT compacts dead MVCC rows in memory & on disk
+    db.execute("UPDATE members SET score = 99 WHERE id = 1")
+    db.execute("UPDATE members SET score = 100 WHERE id = 1")
+    assert len(db.store.tables[0].rows) == 5
+    db.execute("CHECKPOINT")
+    assert len(db.store.tables[0].rows) == 3
+    chk = db.execute("SELECT score FROM members WHERE id = 1")
+    assert len(chk.rows) == 1 and chk.rows[0][0] == "100"
+
+    db.close()
+    _cleanup_db(path)
+
 test_crud_and_pg_dialect()
 test_multiprocess_writers()
+test_constraints_groupby_exists_checkpoint()
 print("test_strictql: ok")

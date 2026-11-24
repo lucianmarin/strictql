@@ -103,15 +103,17 @@ class ColumnDef:
     is_pk: bool
     is_serial: bool
     not_null: bool
+    is_unique: bool
     default_val: str
     has_default: bool
 
-    def __init__(self, name: str, col_type: str, is_pk: bool = False, is_serial: bool = False, not_null: bool = False, default_val: str = "", has_default: bool = False) -> None:
+    def __init__(self, name: str, col_type: str, is_pk: bool = False, is_serial: bool = False, not_null: bool = False, default_val: str = "", has_default: bool = False, is_unique: bool = False) -> None:
         self.name = name
         self.col_type = col_type
         self.is_pk = is_pk
         self.is_serial = is_serial
         self.not_null = not_null
+        self.is_unique = is_unique
         self.default_val = default_val
         self.has_default = has_default
 
@@ -385,14 +387,16 @@ class Storage:
             self.tables[ti].append_row(Row(rid, xmin, xmax, cells))
             if rid >= self.tables[ti].next_seq:
                 self.tables[ti].next_seq = rid + 1
-        elif op == "IDX":
-            # IDX <table> <col_name>
+        elif op == "IDX" or op == "UIDX":
+            # IDX/UIDX <table> <col_name>
             tname = _unescape_field(parts[1])
             cname = _unescape_field(parts[2])
             ti = self.find_table(tname)
             if ti >= 0:
                 ci = self.tables[ti].col_index(cname)
                 if ci >= 0:
+                    if op == "UIDX":
+                        self.tables[ti].columns[ci].is_unique = True
                     self.tables[ti].add_index(ci)
         elif op == "DEL":
             # DEL <table> <row_id> <xmax>
@@ -509,7 +513,8 @@ class Storage:
             while ii < len(t.indexes):
                 ci = t.indexes[ii].col_idx
                 if ci >= 0 and ci < len(t.columns) and not t.columns[ci].is_pk:
-                    lines.append("IDX\t" + _escape_field(t.name) + "\t" + _escape_field(t.columns[ci].name))
+                    tag = "UIDX\t" if t.columns[ci].is_unique else "IDX\t"
+                    lines.append(tag + _escape_field(t.name) + "\t" + _escape_field(t.columns[ci].name))
                 ii += 1
             ti += 1
         out = "\n".join(lines) + "\n"
@@ -551,7 +556,8 @@ class Storage:
             while ii < len(t.indexes):
                 ci = t.indexes[ii].col_idx
                 if ci >= 0 and ci < len(t.columns) and not t.columns[ci].is_pk:
-                    lines.append("IDX\t" + _escape_field(t.name) + "\t" + _escape_field(t.columns[ci].name))
+                    tag = "UIDX\t" if t.columns[ci].is_unique else "IDX\t"
+                    lines.append(tag + _escape_field(t.name) + "\t" + _escape_field(t.columns[ci].name))
                 ii += 1
             ti += 1
         out = "\n".join(lines) + "\n"
@@ -565,6 +571,9 @@ class Storage:
             _st_rename(tmp_path.bin, self.path.bin)
         if os.exists(self.wal_path):
             os.remove(self.wal_path)
+        self.tables = []
+        self._load_file(self.path)
+        self.wal_offset = 0
         self.flock.unlock()
 
     def close(self) -> None:

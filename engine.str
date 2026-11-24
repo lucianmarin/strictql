@@ -1216,8 +1216,9 @@ class Database:
                             if p.match_op(")"):
                                 uq_ci = self.store.tables[ti].col_index(uq_col)
                                 if uq_ci >= 0:
+                                    self.store.tables[ti].columns[uq_ci].is_unique = True
                                     self.store.tables[ti].add_index(uq_ci)
-                                    self._commit_records(["IDX\t" + storage._escape_field(self.store.tables[ti].name) + "\t" + storage._escape_field(uq_col)])
+                                    self._commit_records(["UIDX\t" + storage._escape_field(self.store.tables[ti].name) + "\t" + storage._escape_field(uq_col)])
                             else:
                                 while p.peek_kind() != "EOF" and not p.match_op(")"):
                                     p.step()
@@ -1458,7 +1459,7 @@ class Database:
                         row_vals.append("")
                     ci += 1
 
-                # Enforce PRIMARY KEY uniqueness
+                # Enforce PRIMARY KEY and UNIQUE constraints
                 dup_pk = False
                 if pk_ci >= 0 and not row_nulls[pk_ci] and pk_islot >= 0:
                     pkv = row_vals[pk_ci]
@@ -1470,9 +1471,26 @@ class Database:
                                 dup_pk = True
                                 break
                             bi_pk += 1
+                if not dup_pk:
+                    uci = 0
+                    while uci < len(self.store.tables[ti].columns):
+                        if self.store.tables[ti].columns[uci].is_unique and not row_nulls[uci]:
+                            u_islot = self.store.tables[ti].find_index(uci)
+                            uv = row_vals[uci]
+                            if u_islot >= 0 and uv in self.store.tables[ti].indexes[u_islot].buckets:
+                                ubkt = self.store.tables[ti].indexes[u_islot].buckets[uv]
+                                ubi = 0
+                                while ubi < len(ubkt):
+                                    if self.store.tables[ti].rows[ubkt[ubi]].is_visible(txid):
+                                        dup_pk = True
+                                        break
+                                    ubi += 1
+                            if dup_pk:
+                                break
+                        uci += 1
                 if dup_pk:
                     if not has_on_conflict:
-                        raise f"UniqueViolation: duplicate key value violates primary key constraint on '{tname}'"
+                        raise f"UniqueViolation: duplicate key value violates unique constraint on '{tname}'"
                 else:
                     row = storage.Row(rid, txid, 0, storage.encode_row(self.store.tables[ti].columns, row_vals, row_nulls))
                     wal_recs.append(self.store._serialize_row(self.store.tables[ti].name, row))
@@ -3382,11 +3400,28 @@ class Database:
             nulls[cidx] = False
             k += 1
 
+        if self._has_unique_violation(ti, txid, vals, nulls):
+            raise f"UniqueViolation: duplicate key value violates unique constraint on '{self.store.tables[ti].name}'"
         row = storage.Row(rid, txid, 0, storage.encode_row(self.store.tables[ti].columns, vals, nulls))
         rec = self.store._serialize_row(self.store.tables[ti].name, row)
         self.store.tables[ti].append_row(row)
         self._commit_records([rec])
         return QueryResult([], [], "INSERT 0 1", 1)
+
+    def _has_unique_violation(self, ti: int, txid: int, vals: list[str], nulls: list[bool]) -> bool:
+        ci = 0
+        while ci < len(self.store.tables[ti].columns):
+            if (self.store.tables[ti].columns[ci].is_pk or self.store.tables[ti].columns[ci].is_unique) and not nulls[ci]:
+                islot = self.store.tables[ti].find_index(ci)
+                if islot >= 0 and vals[ci] in self.store.tables[ti].indexes[islot].buckets:
+                    bkt = self.store.tables[ti].indexes[islot].buckets[vals[ci]]
+                    bi = 0
+                    while bi < len(bkt):
+                        if self.store.tables[ti].rows[bkt[bi]].is_visible(txid):
+                            return True
+                        bi += 1
+            ci += 1
+        return False
 
     def _exec_literal_insert(self, plan: _InsertPlan, vals_in: list[str], nulls_in: list[bool]) -> QueryResult:
         if not self.in_tx:
@@ -3419,6 +3454,8 @@ class Database:
                 nulls[cidx] = False
             k += 1
 
+        if self._has_unique_violation(ti, txid, vals, nulls):
+            raise f"UniqueViolation: duplicate key value violates unique constraint on '{self.store.tables[ti].name}'"
         row = storage.Row(rid, txid, 0, storage.encode_row(self.store.tables[ti].columns, vals, nulls))
         rec = self.store._serialize_row(self.store.tables[ti].name, row)
         self.store.tables[ti].append_row(row)
@@ -3497,6 +3534,12 @@ class Database:
         if p.peek_kind() == "EOF" or p.match_op(";"):
             return QueryResult([], [], "", 0)
 
+        if p.match_kw("CHECKPOINT"):
+            self.store.checkpoint()
+            return QueryResult([], [], "CHECKPOINT", 0)
+        if p.match_kw("VACUUM"):
+            self.store.checkpoint()
+            return QueryResult([], [], "VACUUM", 0)
         if p.match_kw("BEGIN"):
             self.in_tx = True
             self.tx_id = self.store.next_txid()
