@@ -230,7 +230,25 @@ class _OutBuf:
             self.put_i32_be(25)
             i += 1
 
-    def write_row_description(self, cols: list[str]) -> None:
+    def _pg_type_oid(self, col_type: str) -> int:
+        u = col_type.upper()
+        if u == "INTEGER" or u == "INT" or u == "INT4" or u == "SERIAL":
+            return 23
+        if u == "BIGINT" or u == "INT8" or u == "BIGSERIAL":
+            return 20
+        if u == "DOUBLE PRECISION" or u == "FLOAT" or u == "FLOAT8" or u == "REAL" or u == "NUMERIC":
+            return 701
+        if u == "BOOLEAN" or u == "BOOL":
+            return 16
+        if u == "JSONB":
+            return 3802
+        if u == "JSON":
+            return 114
+        if u == "INT4ARRAY":
+            return 1007
+        return 25
+
+    def write_row_description(self, cols: list[str], col_types: list[str] = []) -> None:
         total = 4 + 2
         i = 0
         while i < len(cols):
@@ -242,10 +260,11 @@ class _OutBuf:
         self.put_i16_be(len(cols))
         i = 0
         while i < len(cols):
+            oid = self._pg_type_oid(col_types[i]) if i < len(col_types) else 25
             self.put_cstr(cols[i])
             self.put_i32_be(0)
             self.put_i16_be(0)
-            self.put_i32_be(25)
+            self.put_i32_be(oid)
             self.put_i16_be(-1)
             self.put_i32_be(-1)
             self.put_i16_be(0)
@@ -683,7 +702,7 @@ def handle_client(fd: i32) -> None:
                     res = _db_list[db_idx].execute_tokens(tokens)
                     _unlock_db(db_idx)
                     if len(res.columns) > 0:
-                        out.write_row_description(res.columns)
+                        out.write_row_description(res.columns, res.col_types)
                     out.write_rows_and_complete(res.rows, res.command_tag)
                 except Exception as err:
                     _unlock_db(db_idx)
@@ -702,7 +721,7 @@ def handle_client(fd: i32) -> None:
                         res = _db_list[db_idx].execute(query)
                     _unlock_db(db_idx)
                     if len(res.columns) > 0:
-                        out.write_row_description(res.columns)
+                        out.write_row_description(res.columns, res.col_types)
                     out.write_rows_and_complete(res.rows, res.command_tag)
                 except Exception as err:
                     _unlock_db(db_idx)
@@ -783,7 +802,7 @@ def handle_client(fd: i32) -> None:
                     portal_res_tag = res.command_tag
                     portal_has_res = True
                     if len(portal_res_cols) > 0:
-                        out.write_row_description(portal_res_cols)
+                        out.write_row_description(portal_res_cols, res.col_types)
                     else:
                         out.write_simple_tag(110) # 'n' NoData
                 except Exception as err:

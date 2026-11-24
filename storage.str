@@ -17,6 +17,18 @@ def _st_fflush(fp: addr[u8]) -> i32:
 def _st_fclose(fp: addr[u8]) -> i32:
     pass
 
+@extern("fileno")
+def _st_fileno(fp: addr[u8]) -> i32:
+    pass
+
+@extern("fsync")
+def _st_fsync(fd: i32) -> i32:
+    pass
+
+@extern("rename")
+def _st_rename(oldpath: addr[u8], newpath: addr[u8]) -> i32:
+    pass
+
 def _escape_field(s: str) -> str:
     b = s.bin
     n = len(s)
@@ -469,6 +481,7 @@ class Storage:
         if fp2 is not None:
             _st_fwrite(payload.bin, 1, len(payload), fp2)
             _st_fflush(fp2)
+            _st_fsync(_st_fileno(fp2))
         cur = self.current_txid()
         if cur == self.last_loaded_txid + 1:
             self.last_loaded_txid = cur
@@ -500,8 +513,14 @@ class Storage:
                 ii += 1
             ti += 1
         out = "\n".join(lines) + "\n"
-        with open(self.path, "w") as f:
-            f.write(out)
+        tmp_path = self.path + ".tmp"
+        tfp = _st_fopen(tmp_path.bin, "w".bin)
+        if tfp is not None:
+            _st_fwrite(out.bin, 1, len(out), tfp)
+            _st_fflush(tfp)
+            _st_fsync(_st_fileno(tfp))
+            _st_fclose(tfp)
+            _st_rename(tmp_path.bin, self.path.bin)
         if os.exists(self.wal_path):
             os.remove(self.wal_path)
         self.last_loaded_txid = self.next_txid()
@@ -536,8 +555,14 @@ class Storage:
                 ii += 1
             ti += 1
         out = "\n".join(lines) + "\n"
-        with open(self.path, "w") as f:
-            f.write(out)
+        tmp_path = self.path + ".tmp"
+        tfp = _st_fopen(tmp_path.bin, "w".bin)
+        if tfp is not None:
+            _st_fwrite(out.bin, 1, len(out), tfp)
+            _st_fflush(tfp)
+            _st_fsync(_st_fileno(tfp))
+            _st_fclose(tfp)
+            _st_rename(tmp_path.bin, self.path.bin)
         if os.exists(self.wal_path):
             os.remove(self.wal_path)
         self.flock.unlock()
