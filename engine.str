@@ -1605,6 +1605,17 @@ class Database:
             where_pos = p.pos
             self._skip_where_clause(p)
 
+        group_cols: list[str] = []
+        if p.match_kw("GROUP"):
+            p.match_kw("BY")
+            while p.peek_kind() != "EOF":
+                gc = p.expect_ident()
+                if p.match_op("."):
+                    gc = p.expect_ident()
+                group_cols.append(gc)
+                if not p.match_op(","):
+                    break
+
         order_tbls: list[str] = []
         order_cols: list[str] = []
         order_descs: list[bool] = []
@@ -1795,14 +1806,136 @@ class Database:
                                 break
                     ri += 1
             else:
-                ri = 0
-                while ri < len(self.store.tables[ti].rows):
-                    if self.store.tables[ti].rows[ri].is_visible(snap):
-                        if self._row_matches_where(p, where_pos, ti, ri):
-                            matched.append(ri)
-                    ri += 1
+                # Reverse-scan early-exit for ORDER BY <numeric_pk> DESC LIMIT N
+                rev_pk_ci = -1
+                if len(aggs) == 0 and not distinct and limit_n >= 0 and len(order_cols) == 1 and order_descs[0]:
+                    oci_try = self.store.tables[ti].col_index(order_cols[0])
+                    if oci_try >= 0 and self.store.tables[ti].columns[oci_try].is_pk and _is_numeric_col_type(self.store.tables[ti].columns[oci_try].col_type):
+                        rev_pk_ci = oci_try
+                if rev_pk_ci >= 0:
+                    cap = offset_n + limit_n
+                    ri = len(self.store.tables[ti].rows) - 1
+                    min_top = 0.0
+                    top_cnt = 0
+                    while ri >= 0:
+                        if self.store.tables[ti].rows[ri].is_visible(snap):
+                            cur_pk = self.store.tables[ti].rows[ri].get_float(rev_pk_ci)
+                            if top_cnt >= cap and cur_pk < min_top:
+                                break
+                            if self._row_matches_where(p, where_pos, ti, ri):
+                                matched.append(ri)
+                                if top_cnt == 0 or cur_pk < min_top:
+                                    min_top = cur_pk
+                                top_cnt += 1
+                        ri -= 1
+                else:
+                    ri = 0
+                    while ri < len(self.store.tables[ti].rows):
+                        if self.store.tables[ti].rows[ri].is_visible(snap):
+                            if self._row_matches_where(p, where_pos, ti, ri):
+                                matched.append(ri)
+                        ri += 1
 
         if len(aggs) > 0:
+            if len(group_cols) > 0:
+                g_cidxs: list[int] = []
+                gi = 0
+                while gi < len(group_cols):
+                    gci = self.store.tables[ti].col_index(group_cols[gi])
+                    if gci < 0:
+                        raise f"ColumnError: column '{group_cols[gi]}' does not exist"
+                    g_cidxs.append(gci)
+                    gi += 1
+                grp_keys: list[str] = []
+                grp_map: dict[str, int] = {}
+                grp_rows: list[list[int]] = []
+                mi = 0
+                while mi < len(matched):
+                    ridx = matched[mi]
+                    gkey = ""
+                    gi = 0
+                    while gi < len(g_cidxs):
+                        if gi > 0:
+                            gkey += "\x1f"
+                        if self.store.tables[ti].rows[ridx].is_null(g_cidxs[gi]):
+                            gkey += "\x00NULL"
+                        else:
+                            gkey += self.store.tables[ti].rows[ridx].get_str(g_cidxs[gi])
+                        gi += 1
+                    if gkey in grp_map:
+                        grp_rows[grp_map[gkey]].append(ridx)
+                    else:
+                        gslot = len(grp_rows)
+                        grp_map[gkey.copy()] = gslot
+                        grp_keys.append(gkey)
+                        grp_rows.append([ridx])
+                    mi += 1
+                g_cols: list[str] = []
+                g_types: list[str] = []
+                ai = 0
+                while ai < len(aggs):
+                    ag = aggs[ai]
+                    g_cols.append(ag.alias.copy())
+                    if ag.fn == "COUNT":
+                        g_types.append("BIGINT")
+                    else:
+                        aci_t = self.store.tables[ti].col_index(ag.col)
+                        g_types.append(self.store.tables[ti].columns[aci_t].col_type.copy() if aci_t >= 0 else "TEXT")
+                    ai += 1
+                g_out: list[list[str]] = []
+                gsi = 0
+                while gsi < len(grp_rows):
+                    gidxs = grp_rows[gsi]
+                    grow: list[str] = []
+                    ai = 0
+                    while ai < len(aggs):
+                        ag = aggs[ai]
+                        if ag.fn == "COUNT":
+                            if ag.col == "*":
+                                grow.append(str(len(gidxs)))
+                            else:
+                                aci = self.store.tables[ti].col_index(ag.col)
+                                cnt = 0
+                                k = 0
+                                while k < len(gidxs):
+                                    if aci >= 0 and not self.store.tables[ti].rows[gidxs[k]].is_null(aci):
+                                        cnt += 1
+                                    k += 1
+                                grow.append(str(cnt))
+                        elif ag.fn == "SUM":
+                            aci = self.store.tables[ti].col_index(ag.col)
+                            total = 0.0
+                            k = 0
+                            while k < len(gidxs):
+                                if aci >= 0 and not self.store.tables[ti].rows[gidxs[k]].is_null(aci):
+                                    total += self.store.tables[ti].rows[gidxs[k]].get_float(aci)
+                                k += 1
+                            grow.append(str(total))
+                        elif ag.fn == "MAX" or ag.fn == "MIN":
+                            aci = self.store.tables[ti].col_index(ag.col)
+                            best = ""
+                            has_best = False
+                            k = 0
+                            while k < len(gidxs):
+                                if aci >= 0 and not self.store.tables[ti].rows[gidxs[k]].is_null(aci):
+                                    v = self.store.tables[ti].rows[gidxs[k]].get_str(aci)
+                                    if not has_best:
+                                        best = v.copy()
+                                        has_best = True
+                                    else:
+                                        c = _cmp_values(v, best)
+                                        if (ag.fn == "MAX" and c > 0) or (ag.fn == "MIN" and c < 0):
+                                            best = v.copy()
+                                k += 1
+                            grow.append(best if has_best else "NULL")
+                        else:
+                            grow.append("0")
+                        ai += 1
+                    g_out.append(grow)
+                    gsi += 1
+                n_g = len(g_out)
+                return QueryResult(g_cols, g_out, "SELECT " + str(n_g), n_g, g_types)
+
             agg_cols: list[str] = []
             agg_vals: list[str] = []
             ai = 0
