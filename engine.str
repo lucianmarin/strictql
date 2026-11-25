@@ -2002,34 +2002,95 @@ class Database:
                     elif p.match_kw("IN"):
                         if p.match_op("("):
                             keys: list[str] = []
+                            fast_max_gb = False
                             if p.match_kw("SELECT"):
-                                sub_res = self._exec_select(p)
-                                p.match_op(")")
-                                si = 0
-                                while si < len(sub_res.rows):
-                                    if len(sub_res.rows[si]) > 0 and sub_res.rows[si][0] != "NULL":
-                                        keys.append(sub_res.rows[si][0].copy())
-                                    si += 1
+                                sub_start = p.pos
+                                if (wci == self.store.tables[ti].pk_col
+                                        and len(aggs) == 0 and not distinct and limit_n >= 0
+                                        and len(order_cols) == 1 and order_descs[0]
+                                        and self.store.tables[ti].col_index(order_cols[0]) == wci
+                                        and p.match_kw("MAX") and p.match_op("(")):
+                                    mcol = p.expect_ident()
+                                    if p.match_op("."):
+                                        mcol = p.expect_ident()
+                                    if self.store.tables[ti].col_index(mcol) == wci and p.match_op(")") and p.match_kw("FROM"):
+                                        sub_tbl = p.expect_ident()
+                                        if sub_tbl.lower() == self.store.tables[ti].name.lower():
+                                            inner_wpos = -1
+                                            if p.match_kw("WHERE"):
+                                                inner_wpos = p.pos
+                                                depth_w = 0
+                                                while p.peek_kind() != "EOF":
+                                                    if p.peek_kind() == "OP" and p.peek_val() == "(":
+                                                        depth_w += 1
+                                                    elif p.peek_kind() == "OP" and p.peek_val() == ")":
+                                                        if depth_w == 0:
+                                                            break
+                                                        depth_w -= 1
+                                                    elif depth_w == 0 and p.peek_kind() == "IDENT" and p.peek_upper() == "GROUP":
+                                                        break
+                                                    p.pos += 1
+                                            if p.match_kw("GROUP") and p.match_kw("BY"):
+                                                gcol_s = p.expect_ident()
+                                                if p.match_op("."):
+                                                    gcol_s = p.expect_ident()
+                                                gci_s = self.store.tables[ti].col_index(gcol_s)
+                                                if gci_s >= 0 and p.match_op(")"):
+                                                    nxt_gb = p.peek_upper() if p.peek_kind() == "IDENT" else ""
+                                                    if nxt_gb != "AND" and nxt_gb != "OR":
+                                                        fast_max_gb = True
+                                                        used_idx = True
+                                                        in_nodes: list[_PredNode] = []
+                                                        in_root = -2
+                                                        if inner_wpos >= 0:
+                                                            in_root = self._compile_where(p, inner_wpos, ti, in_nodes)
+                                                        cap_gb = offset_n + limit_n
+                                                        seen_gb: dict[str, bool] = {}
+                                                        self.store.tables[ti].ensure_pk_order()
+                                                        use_pko_gb = not self.store.tables[ti].pk_sorted
+                                                        k_gb = (len(self.store.tables[ti].pk_order) - 1) if use_pko_gb else (len(self.store.tables[ti].rows) - 1)
+                                                        while k_gb >= 0:
+                                                            ri_gb = self.store.tables[ti].pk_order[k_gb] if use_pko_gb else k_gb
+                                                            if self.store.tables[ti].rows[ri_gb].is_visible(snap):
+                                                                ok_gb = True if in_root == -2 else (self._eval_pred(in_nodes, in_root, self.store.tables[ti], ri_gb) if in_root >= 0 else self._row_matches_where(p, inner_wpos, ti, ri_gb))
+                                                                if ok_gb:
+                                                                    gk_gb = "\x00NULL" if self.store.tables[ti].rows[ri_gb].is_null(gci_s) else self.store.tables[ti].rows[ri_gb].get_str(gci_s)
+                                                                    if gk_gb not in seen_gb:
+                                                                        seen_gb[gk_gb] = True
+                                                                        matched.append(ri_gb)
+                                                                        if len(matched) >= cap_gb:
+                                                                            break
+                                                            k_gb -= 1
+                                if not fast_max_gb:
+                                    p.pos = sub_start
+                                    sub_res = self._exec_select(p)
+                                    p.match_op(")")
+                                    si = 0
+                                    while si < len(sub_res.rows):
+                                        if len(sub_res.rows[si]) > 0 and sub_res.rows[si][0] != "NULL":
+                                            keys.append(sub_res.rows[si][0].copy())
+                                        si += 1
                             else:
                                 while not p.match_op(")"):
                                     wlit = p.parse_literal()
                                     if not wlit.is_null:
                                         keys.append(wlit.value.copy())
                                     p.match_op(",")
-                            nxt = p.peek_upper() if p.peek_kind() == "IDENT" else ""
-                            if nxt != "AND" and nxt != "OR":
-                                used_idx = True
-                                ki = 0
-                                while ki < len(keys):
-                                    if keys[ki] in self.store.tables[ti].indexes[islot].buckets:
-                                        bkt = self.store.tables[ti].indexes[islot].buckets[keys[ki]]
-                                        bi = 0
-                                        while bi < len(bkt):
-                                            ridx = bkt[bi]
-                                            if self.store.tables[ti].rows[ridx].is_visible(snap):
-                                                matched.append(ridx)
-                                            bi += 1
-                                    ki += 1
+                            if not fast_max_gb:
+                                nxt = p.peek_upper() if p.peek_kind() == "IDENT" else ""
+                                if nxt != "AND" and nxt != "OR":
+                                    used_idx = True
+                                    ki = 0
+                                    while ki < len(keys):
+                                        if keys[ki] in self.store.tables[ti].indexes[islot].buckets:
+                                            bkt = self.store.tables[ti].indexes[islot].buckets[keys[ki]]
+                                            bi = 0
+                                            while bi < len(bkt):
+                                                ridx = bkt[bi]
+                                                if self.store.tables[ti].rows[ridx].is_visible(snap):
+                                                    matched.append(ridx)
+                                                bi += 1
+                                        ki += 1
             p.pos = saved_p
 
         if not used_idx and where_pos >= 0:
@@ -2079,44 +2140,63 @@ class Database:
             if fast_like_ci >= 0:
                 use_fast_sub = _is_simple_contains_pat(fast_like_pat)
                 needle = fast_like_pat[1:len(fast_like_pat) - 1] if use_fast_sub else ""
-                early_cap = (offset_n + limit_n) if (len(order_cols) == 0 and not distinct and limit_n >= 0) else -1
-                ri = 0
-                while ri < len(self.store.tables[ti].rows):
-                    row = self.store.tables[ti].rows[ri]
-                    if row.is_visible(snap) and not row.is_null(fast_like_ci):
-                        rv_s = row.get_str(fast_like_ci)
-                        hit = _contains_bytes(rv_s, needle, fast_like_icase) if use_fast_sub else _like_match(rv_s.copy(), fast_like_pat.copy(), fast_like_icase)
-                        if hit:
-                            matched.append(ri)
-                            if early_cap >= 0 and len(matched) >= early_cap:
-                                break
-                    ri += 1
+                rev_pk_ci_l = -1
+                if len(aggs) == 0 and not distinct and limit_n >= 0 and len(order_cols) == 1 and order_descs[0]:
+                    oci_try_l = self.store.tables[ti].col_index(order_cols[0])
+                    if oci_try_l >= 0 and oci_try_l == self.store.tables[ti].pk_col:
+                        rev_pk_ci_l = oci_try_l
+                if rev_pk_ci_l >= 0:
+                    cap_l = offset_n + limit_n
+                    self.store.tables[ti].ensure_pk_order()
+                    use_pko_l = not self.store.tables[ti].pk_sorted
+                    k_l = (len(self.store.tables[ti].pk_order) - 1) if use_pko_l else (len(self.store.tables[ti].rows) - 1)
+                    while k_l >= 0:
+                        ri = self.store.tables[ti].pk_order[k_l] if use_pko_l else k_l
+                        row = self.store.tables[ti].rows[ri]
+                        if row.is_visible(snap) and not row.is_null(fast_like_ci):
+                            rv_s = row.get_str(fast_like_ci)
+                            hit = _contains_bytes(rv_s, needle, fast_like_icase) if use_fast_sub else _like_match(rv_s.copy(), fast_like_pat.copy(), fast_like_icase)
+                            if hit:
+                                matched.append(ri)
+                                if len(matched) >= cap_l:
+                                    break
+                        k_l -= 1
+                else:
+                    early_cap = (offset_n + limit_n) if (len(order_cols) == 0 and not distinct and limit_n >= 0) else -1
+                    ri = 0
+                    while ri < len(self.store.tables[ti].rows):
+                        row = self.store.tables[ti].rows[ri]
+                        if row.is_visible(snap) and not row.is_null(fast_like_ci):
+                            rv_s = row.get_str(fast_like_ci)
+                            hit = _contains_bytes(rv_s, needle, fast_like_icase) if use_fast_sub else _like_match(rv_s.copy(), fast_like_pat.copy(), fast_like_icase)
+                            if hit:
+                                matched.append(ri)
+                                if early_cap >= 0 and len(matched) >= early_cap:
+                                    break
+                        ri += 1
             else:
                 # Reverse-scan early-exit for ORDER BY <numeric_pk> DESC LIMIT N
                 rev_pk_ci = -1
                 if len(aggs) == 0 and not distinct and limit_n >= 0 and len(order_cols) == 1 and order_descs[0]:
                     oci_try = self.store.tables[ti].col_index(order_cols[0])
-                    if oci_try >= 0 and self.store.tables[ti].columns[oci_try].is_pk and _is_numeric_col_type(self.store.tables[ti].columns[oci_try].col_type):
+                    if oci_try >= 0 and oci_try == self.store.tables[ti].pk_col:
                         rev_pk_ci = oci_try
                 pred_nodes2: list[_PredNode] = []
                 pred_root2 = self._compile_where(p, where_pos, ti, pred_nodes2)
                 if rev_pk_ci >= 0:
                     cap = offset_n + limit_n
-                    ri = len(self.store.tables[ti].rows) - 1
-                    min_top = 0.0
-                    top_cnt = 0
-                    while ri >= 0:
+                    self.store.tables[ti].ensure_pk_order()
+                    use_pko = not self.store.tables[ti].pk_sorted
+                    k_r = (len(self.store.tables[ti].pk_order) - 1) if use_pko else (len(self.store.tables[ti].rows) - 1)
+                    while k_r >= 0:
+                        ri = self.store.tables[ti].pk_order[k_r] if use_pko else k_r
                         if self.store.tables[ti].rows[ri].is_visible(snap):
-                            cur_pk = self.store.tables[ti].rows[ri].get_float(rev_pk_ci)
-                            if top_cnt >= cap and cur_pk < min_top:
-                                break
                             ok_r = True if pred_root2 == -2 else (self._eval_pred(pred_nodes2, pred_root2, self.store.tables[ti], ri) if pred_root2 >= 0 else self._row_matches_where(p, where_pos, ti, ri))
                             if ok_r:
                                 matched.append(ri)
-                                if top_cnt == 0 or cur_pk < min_top:
-                                    min_top = cur_pk
-                                top_cnt += 1
-                        ri -= 1
+                                if len(matched) >= cap:
+                                    break
+                        k_r -= 1
                 elif pred_root2 == -2:
                     ri = 0
                     while ri < len(self.store.tables[ti].rows):

@@ -222,12 +222,44 @@ class HashIndex:
         else:
             self.buckets[key] = [row_idx]
 
+def _tbl_qsort_f64(idxs: list[int], keys: list[f64], lo: int, hi: int) -> None:
+    if lo >= hi:
+        return
+    mid = (lo + hi) // 2
+    piv = keys[mid]
+    i = lo
+    j = hi
+    while i <= j:
+        while keys[i] < piv:
+            i += 1
+        while keys[j] > piv:
+            j -= 1
+        if i <= j:
+            tk = keys[i]
+            keys[i] = keys[j]
+            keys[j] = tk
+            ti = idxs[i]
+            idxs[i] = idxs[j]
+            idxs[j] = ti
+            i += 1
+            j -= 1
+    if lo < j:
+        _tbl_qsort_f64(idxs, keys, lo, j)
+    if i < hi:
+        _tbl_qsort_f64(idxs, keys, i, hi)
+
 class Table:
     name: str
     columns: list[ColumnDef]
     rows: list[Row]
     indexes: list[HashIndex]
     next_seq: i64
+    pk_col: int
+    pk_sorted: bool
+    pk_has_rows: bool
+    pk_max: f64
+    pk_order: list[int]
+    pk_order_len: int
 
     def __init__(self, name: str, columns: list[ColumnDef]) -> None:
         self.name = name
@@ -235,11 +267,39 @@ class Table:
         self.rows = []
         self.indexes = []
         self.next_seq = 1
+        self.pk_col = -1
+        self.pk_sorted = True
+        self.pk_has_rows = False
+        self.pk_max = 0.0
+        self.pk_order = []
+        self.pk_order_len = 0
         i = 0
         while i < len(self.columns):
             if self.columns[i].is_pk:
                 self.indexes.append(HashIndex(i))
+                ct = self.columns[i].col_type.upper()
+                if ct == "INT" or ct == "INTEGER" or ct == "BIGINT" or ct == "SERIAL" or ct == "FLOAT" or ct == "DOUBLE" or ct == "REAL" or ct == "NUMERIC":
+                    self.pk_col = i
             i += 1
+
+    def ensure_pk_order(self) -> None:
+        if self.pk_col < 0 or self.pk_sorted:
+            return
+        if self.pk_order_len == len(self.rows):
+            return
+        n = len(self.rows)
+        idxs: list[int] = []
+        keys: list[f64] = []
+        i = 0
+        while i < n:
+            if not self.rows[i].is_null(self.pk_col):
+                idxs.append(i)
+                keys.append(self.rows[i].get_float(self.pk_col))
+            i += 1
+        if len(idxs) > 1:
+            _tbl_qsort_f64(idxs, keys, 0, len(idxs) - 1)
+        self.pk_order = idxs
+        self.pk_order_len = n
 
     def col_index(self, col_name: str) -> int:
         target = col_name.lower()
@@ -271,6 +331,16 @@ class Table:
 
     def append_row(self, row: Row) -> int:
         ridx = len(self.rows)
+        if self.pk_col >= 0 and self.pk_sorted:
+            if row.is_null(self.pk_col):
+                self.pk_sorted = False
+            else:
+                pv = row.get_float(self.pk_col)
+                if self.pk_has_rows and pv <= self.pk_max:
+                    self.pk_sorted = False
+                else:
+                    self.pk_max = pv
+                    self.pk_has_rows = True
         ii = 0
         while ii < len(self.indexes):
             ci = self.indexes[ii].col_idx
