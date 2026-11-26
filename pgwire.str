@@ -2,7 +2,6 @@
 import engine
 import sql
 import threading
-from typing import Callable
 
 @extern("pthread_create")
 def _pg_pthread_create(tid: addr[u64], attr: addr[u8] | None, start_routine: Callable[[addr[u8]], addr[u8] | None], arg: addr[u8] | None) -> i32:
